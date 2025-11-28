@@ -1,7 +1,6 @@
-import { Keypair, PublicKey, Transaction, SystemProgram, ComputeBudgetProgram } from '@solana/web3.js';
+import { Keypair, PublicKey, VersionedTransaction } from '@solana/web3.js';
 import { connection } from '../../utils/solana';
-import { keypairFromPrivateKey } from '../../utils/solana';
-import { lamportsToSol } from '../../constants/solana';
+import { keypairFromPrivateKey, solToLamports } from '../../utils/solana';
 import { WalletModel } from '../../db/models/wallet';
 import { TransactionModel } from '../../db/models/transaction';
 import { ProjectModel } from '../../db/models/project';
@@ -16,25 +15,41 @@ import {
   BatchSwapResult,
   TokenBalance,
   SwapStats,
-  PoolInfo,
-  SwapType,
 } from './types';
 
-/**
- * Swap Manager
- * 
- * Handles token buy/sell operations:
- * - Single wallet swaps
- * - Batch (multi-wallet) swaps
- * - Fee collection (0.7% for non-premium)
- * - Statistics tracking
- * - Jupiter/Raydium integration
- * - Jito bundle support
- */
+interface JupiterQuoteResponse {
+  inputMint: string;
+  inAmount: string;
+  outputMint: string;
+  outAmount: string;
+  otherAmountThreshold: string;
+  swapMode: string;
+  slippageBps: number;
+  platformFee: null | any;
+  priceImpactPct: string;
+  routePlan: any[];
+}
+
+interface JupiterSwapResponse {
+  swapTransaction: string;
+  lastValidBlockHeight: number;
+}
+
+interface JupiterPriceData {
+  data: {
+    [key: string]: {
+      id: string;
+      type: string;
+      price: number;
+    };
+  };
+}
+
 export class SwapManager {
-  /**
-   * Execute batch swap (multiple wallets)
-   */
+  private readonly JUPITER_QUOTE_API = 'https://quote-api.jup.ag/v6/quote';
+  private readonly JUPITER_SWAP_API = 'https://quote-api.jup.ag/v6/swap';
+  private readonly SOL_MINT = 'So11111111111111111111111111111111111111112';
+
   async executeBatchSwap(options: SwapOptions): Promise<BatchSwapResult> {
     try {
       logger.info('Starting batch swap', {
@@ -47,7 +62,6 @@ export class SwapManager {
       const successful: SwapResult[] = [];
       const failed: SwapResult[] = [];
       
-      // Execute swap for each wallet
       for (const walletId of options.walletIds) {
         try {
           const result = await this.executeSingleSwap({
@@ -61,14 +75,9 @@ export class SwapManager {
           });
           
           successful.push(result);
-          
-          logger.info('Wallet swap successful', {
-            walletId,
-            signature: result.signature,
-          });
+          logger.info('Wallet swap successful', { walletId, signature: result.signature });
         } catch (error) {
           const errorMessage = error instanceof Error ? error.message : 'Unknown error';
-          
           failed.push({
             walletId,
             signature: '',
@@ -78,7 +87,6 @@ export class SwapManager {
             success: false,
             error: errorMessage,
           });
-          
           logger.error('Wallet swap failed', { walletId, error });
         }
       }
@@ -100,35 +108,25 @@ export class SwapManager {
       throw error;
     }
   }
-  
-  /**
-   * Execute single wallet swap
-   */
+
   async executeSingleSwap(options: SingleSwapOptions): Promise<SwapResult> {
     try {
-      // Get wallet with private key
       const wallet = await WalletModel.getWithPrivateKey(options.walletId);
-      
       if (!wallet || !wallet.private_key) {
         throw new Error('Cannot decrypt wallet');
       }
       
       const keypair = keypairFromPrivateKey(wallet.private_key);
-      
-      // Get project and user for fee calculation
       const project = await ProjectModel.findById(wallet.project_id);
-      
       if (!project) {
         throw new Error('Project not found');
       }
       
       const user = await UserModel.findById(project.user_id);
-      
       if (!user) {
         throw new Error('User not found');
       }
       
-      // Execute swap based on type
       if (options.type === 'buy') {
         return await this.executeBuy(keypair, wallet, options, user.id);
       } else {
@@ -139,10 +137,7 @@ export class SwapManager {
       throw error;
     }
   }
-  
-  /**
-   * Execute buy (SOL -> Token)
-   */
+
   private async executeBuy(
     keypair: Keypair,
     wallet: any,
@@ -154,11 +149,7 @@ export class SwapManager {
         throw new Error('Amount SOL is required for buy');
       }
       
-      // Calculate fee
-      const { net: netAmount, fee: feeAmount } = await FeeManager.deductFee(
-        options.amountSol,
-        userId
-      );
+      const { net: netAmount, fee: feeAmount } = await FeeManager.deductFee(options.amountSol, userId);
       
       logger.info('Buy swap', {
         walletId: options.walletId,
@@ -167,36 +158,72 @@ export class SwapManager {
         fee: feeAmount,
       });
       
-      // Collect fee if applicable
       if (feeAmount > 0) {
         await FeeManager.collectFee(keypair, feeAmount);
       }
       
-      // TODO: Get pool info and build swap instruction
-      // For now, use mock transaction
-      const signature = await this.mockSwapTransaction(
-        keypair,
-        netAmount,
-        'buy'
-      );
+      const amountLamports = solToLamports(netAmount);
+      const slippageBps = (options.slippage || 15) * 100;
       
-      // Save transaction to DB
+      const quote = await this.getJupiterQuote({
+        inputMint: this.SOL_MINT,
+        outputMint: options.tokenAddress,
+        amount: amountLamports,
+        slippageBps,
+      });
+      
+      if (!quote) {
+        throw new Error('Failed to get Jupiter quote');
+      }
+      
+      logger.info('Jupiter quote received', {
+        inputAmount: netAmount + ' SOL',
+        outputAmount: quote.outAmount,
+        priceImpact: quote.priceImpactPct,
+      });
+      
+      const swapTx = await this.getJupiterSwapTransaction(quote, keypair.publicKey.toString());
+      if (!swapTx) {
+        throw new Error('Failed to get swap transaction');
+      }
+      
+      const transaction = VersionedTransaction.deserialize(Buffer.from(swapTx.swapTransaction, 'base64'));
+      transaction.sign([keypair]);
+      
+      const signature = await connection.sendRawTransaction(transaction.serialize(), {
+        skipPreflight: false,
+        preflightCommitment: 'confirmed',
+        maxRetries: 3,
+      });
+      
+      logger.info('Buy transaction sent', { signature, walletId: options.walletId });
+      await connection.confirmTransaction(signature, 'confirmed');
+      
+      const tokensReceived = parseInt(quote.outAmount) / Math.pow(10, 6);
+      
       await TransactionModel.create({
         project_id: wallet.project_id,
         wallet_id: wallet.id,
         signature,
         type: 'buy',
-        amount: options.amountSol,
+        amount: netAmount,
         token_address: options.tokenAddress,
         status: 'confirmed',
+        metadata: {
+          inputMint: this.SOL_MINT,
+          outputMint: options.tokenAddress,
+          amountIn: netAmount,
+          amountOut: tokensReceived,
+          priceImpact: quote.priceImpactPct,
+        },
       });
       
       return {
         walletId: wallet.id,
         signature,
         type: 'buy',
-        amountIn: options.amountSol,
-        amountOut: 0, // TODO: Calculate from actual swap
+        amountIn: netAmount,
+        amountOut: tokensReceived,
         success: true,
       };
     } catch (error) {
@@ -204,10 +231,7 @@ export class SwapManager {
       throw error;
     }
   }
-  
-  /**
-   * Execute sell (Token -> SOL)
-   */
+
   private async executeSell(
     keypair: Keypair,
     wallet: any,
@@ -215,20 +239,19 @@ export class SwapManager {
     userId: number
   ): Promise<SwapResult> {
     try {
-      // Calculate amount to sell
       let amountToSell: number;
       
       if (options.amountTokens) {
         amountToSell = options.amountTokens;
       } else if (options.percentage) {
-        // Get token balance
-        const tokenBalance = await this.getTokenBalance(
-          keypair.publicKey.toString(),
-          options.tokenAddress
-        );
+        const tokenBalance = await this.getTokenBalance(keypair.publicKey.toString(), options.tokenAddress);
         amountToSell = (tokenBalance * options.percentage) / 100;
       } else {
         throw new Error('Either amountTokens or percentage is required for sell');
+      }
+      
+      if (amountToSell <= 0) {
+        throw new Error('No tokens to sell');
       }
       
       logger.info('Sell swap', {
@@ -237,28 +260,51 @@ export class SwapManager {
         percentage: options.percentage,
       });
       
-      // TODO: Get pool info and build swap instruction
-      // For now, use mock transaction
-      const signature = await this.mockSwapTransaction(
-        keypair,
-        amountToSell,
-        'sell'
-      );
+      const amountBaseUnits = Math.floor(amountToSell * Math.pow(10, 6));
+      const slippageBps = (options.slippage || 15) * 100;
       
-      // Calculate SOL received (mock)
-      const solReceived = 0.5; // TODO: Get from actual swap
+      const quote = await this.getJupiterQuote({
+        inputMint: options.tokenAddress,
+        outputMint: this.SOL_MINT,
+        amount: amountBaseUnits,
+        slippageBps,
+      });
       
-      // Calculate and collect fee
-      const { net: netAmount, fee: feeAmount } = await FeeManager.deductFee(
-        solReceived,
-        userId
-      );
+      if (!quote) {
+        throw new Error('Failed to get Jupiter quote');
+      }
+      
+      const solToReceive = parseInt(quote.outAmount) / 1e9;
+      
+      logger.info('Jupiter sell quote received', {
+        inputTokens: amountToSell,
+        outputSOL: solToReceive,
+        priceImpact: quote.priceImpactPct,
+      });
+      
+      const swapTx = await this.getJupiterSwapTransaction(quote, keypair.publicKey.toString());
+      if (!swapTx) {
+        throw new Error('Failed to get swap transaction');
+      }
+      
+      const transaction = VersionedTransaction.deserialize(Buffer.from(swapTx.swapTransaction, 'base64'));
+      transaction.sign([keypair]);
+      
+      const signature = await connection.sendRawTransaction(transaction.serialize(), {
+        skipPreflight: false,
+        preflightCommitment: 'confirmed',
+        maxRetries: 3,
+      });
+      
+      logger.info('Sell transaction sent', { signature, walletId: options.walletId });
+      await connection.confirmTransaction(signature, 'confirmed');
+      
+      const { net: netAmount, fee: feeAmount } = await FeeManager.deductFee(solToReceive, userId);
       
       if (feeAmount > 0) {
         await FeeManager.collectFee(keypair, feeAmount);
       }
       
-      // Save transaction to DB
       await TransactionModel.create({
         project_id: wallet.project_id,
         wallet_id: wallet.id,
@@ -267,6 +313,13 @@ export class SwapManager {
         amount: netAmount,
         token_address: options.tokenAddress,
         status: 'confirmed',
+        metadata: {
+          inputMint: options.tokenAddress,
+          outputMint: this.SOL_MINT,
+          amountIn: amountToSell,
+          amountOut: netAmount,
+          priceImpact: quote.priceImpactPct,
+        },
       });
       
       return {
@@ -282,122 +335,109 @@ export class SwapManager {
       throw error;
     }
   }
-  
-  /**
-   * Mock swap transaction (placeholder)
-   * 
-   * TODO: Replace with actual Jupiter/Raydium integration
-   */
-  private async mockSwapTransaction(
-    keypair: Keypair,
-    amount: number,
-    type: SwapType
-  ): Promise<string> {
+
+  private async getJupiterQuote(params: {
+    inputMint: string;
+    outputMint: string;
+    amount: number;
+    slippageBps: number;
+  }): Promise<JupiterQuoteResponse | null> {
     try {
-      logger.warn('Using mock swap transaction', { amount, type });
+      const url = new URL(this.JUPITER_QUOTE_API);
+      url.searchParams.append('inputMint', params.inputMint);
+      url.searchParams.append('outputMint', params.outputMint);
+      url.searchParams.append('amount', params.amount.toString());
+      url.searchParams.append('slippageBps', params.slippageBps.toString());
+      url.searchParams.append('onlyDirectRoutes', 'false');
+      url.searchParams.append('asLegacyTransaction', 'false');
       
-      // Create a simple transfer transaction as placeholder
-      const transaction = new Transaction();
+      const response = await fetch(url.toString());
+      if (!response.ok) {
+        const error = await response.text();
+        logger.error('Jupiter quote failed', { status: response.status, error });
+        return null;
+      }
       
-      // Add compute budget
-      transaction.add(
-        ComputeBudgetProgram.setComputeUnitLimit({
-          units: config.compute.unitLimit,
-        })
-      );
-      
-      transaction.add(
-        ComputeBudgetProgram.setComputeUnitPrice({
-          microLamports: config.compute.unitPrice,
-        })
-      );
-      
-      // Mock transfer (to self)
-      transaction.add(
-        SystemProgram.transfer({
-          fromPubkey: keypair.publicKey,
-          toPubkey: keypair.publicKey,
-          lamports: 1, // Minimal amount
-        })
-      );
-      
-      // Set fee payer and blockhash
-      transaction.feePayer = keypair.publicKey;
-      const { blockhash } = await connection.getLatestBlockhash();
-      transaction.recentBlockhash = blockhash;
-      
-      // Sign and send
-      transaction.sign(keypair);
-      
-      const signature = await connection.sendRawTransaction(
-        transaction.serialize(),
-        {
-          skipPreflight: false,
-          preflightCommitment: 'confirmed',
-        }
-      );
-      
-      await connection.confirmTransaction(signature, 'confirmed');
-      
-      return signature;
+      const quote = await response.json() as JupiterQuoteResponse;
+      return quote;
     } catch (error) {
-      logger.error('Mock swap transaction failed', { error });
-      throw error;
+      logger.error('Failed to get Jupiter quote', { params, error });
+      return null;
     }
   }
-  
-  /**
-   * Get token balance for wallet
-   * 
-   * TODO: Implement actual token balance fetching
-   */
-  private async getTokenBalance(
-    walletAddress: string,
-    _tokenAddress: string
-  ): Promise<number> {
+
+  private async getJupiterSwapTransaction(
+    quote: JupiterQuoteResponse,
+    userPublicKey: string
+  ): Promise<JupiterSwapResponse | null> {
     try {
-      logger.warn('Token balance fetching not implemented, returning mock data');
+      const response = await fetch(this.JUPITER_SWAP_API, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          quoteResponse: quote,
+          userPublicKey,
+          wrapAndUnwrapSol: true,
+          computeUnitPriceMicroLamports: config.compute.unitPrice,
+          dynamicComputeUnitLimit: true,
+        }),
+      });
       
-      // TODO: Fetch actual token balance
-      // Use getTokenAccountsByOwner and parse token account data
+      if (!response.ok) {
+        const error = await response.text();
+        logger.error('Jupiter swap transaction failed', { status: response.status, error });
+        return null;
+      }
       
-      return 1000000; // Mock balance
+      const swapResult = await response.json() as JupiterSwapResponse;
+      return swapResult;
     } catch (error) {
-      logger.error('Failed to get token balance', { walletAddress, error });
+      logger.error('Failed to get swap transaction', { error });
+      return null;
+    }
+  }
+
+  private async getTokenBalance(walletAddress: string, tokenAddress: string): Promise<number> {
+    try {
+      const walletPubkey = new PublicKey(walletAddress);
+      const tokenMint = new PublicKey(tokenAddress);
+      
+      const tokenAccounts = await connection.getParsedTokenAccountsByOwner(walletPubkey, { mint: tokenMint });
+      
+      if (tokenAccounts.value.length === 0) {
+        return 0;
+      }
+      
+      let totalBalance = 0;
+      for (const account of tokenAccounts.value) {
+        const balance = account.account.data.parsed.info.tokenAmount.uiAmount;
+        if (balance) {
+          totalBalance += balance;
+        }
+      }
+      
+      return totalBalance;
+    } catch (error) {
+      logger.error('Failed to get token balance', { walletAddress, tokenAddress, error });
       return 0;
     }
   }
-  
-  /**
-   * Get balances for all project wallets
-   */
-  async getProjectBalances(
-    projectId: number,
-    tokenAddress: string
-  ): Promise<TokenBalance[]> {
+
+  async getProjectBalances(projectId: number, tokenAddress: string): Promise<TokenBalance[]> {
     try {
       const wallets = await WalletModel.findByProjectId(projectId);
       const balances: TokenBalance[] = [];
       
       for (const wallet of wallets) {
         const publicKey = new PublicKey(wallet.address);
-        
-        // Get SOL balance
-        const solBalance = await connection.getBalance(publicKey);
-        
-        // Get token balance
-        const tokenBalance = await this.getTokenBalance(
-          wallet.address,
-          tokenAddress
-        );
-        
-        // TODO: Calculate token value in SOL
-        const tokenValueSol = 0;
+        const solBalanceLamports = await connection.getBalance(publicKey);
+        const tokenBalance = await this.getTokenBalance(wallet.address, tokenAddress);
+        const tokenValueSol = await this.calculateTokenValue(tokenBalance, tokenAddress);
         
         balances.push({
           walletId: wallet.id,
           address: wallet.address,
-          solBalance: lamportsToSol(solBalance),
+          solBalance: solBalanceLamports / 1e9,
           tokenBalance,
           tokenValueSol,
         });
@@ -409,33 +449,27 @@ export class SwapManager {
       throw error;
     }
   }
-  
-  /**
-   * Get swap statistics for project
-   */
+
   async getStats(projectId: number, tokenAddress: string): Promise<SwapStats> {
     try {
       const transactions = await TransactionModel.findByProjectId(projectId);
+      const tokenTxs = transactions.filter(tx => tx.token_address === tokenAddress);
       
-      // Filter by token address
-      const tokenTxs = transactions.filter(
-        tx => tx.token_address === tokenAddress
-      );
-      
-      // Calculate stats
       const buyTxs = tokenTxs.filter(tx => tx.type === 'buy');
       const sellTxs = tokenTxs.filter(tx => tx.type === 'sell');
       
       const totalBoughtSol = buyTxs.reduce((sum, tx) => sum + (tx.amount || 0), 0);
       const totalSoldSol = sellTxs.reduce((sum, tx) => sum + (tx.amount || 0), 0);
       
-      // TODO: Get current holdings and calculate worth
-      const worthSol = 0; // TODO: Calculate current token worth
+      const balances = await this.getProjectBalances(projectId, tokenAddress);
+      const worthSol = balances.reduce((sum: number, b: TokenBalance) => sum + b.tokenValueSol, 0);
+      
+      const holdingPercentage = await this.calculateHoldingPercentage(projectId, tokenAddress);
+      
       const profit = worthSol + totalSoldSol - totalBoughtSol;
       const profitPercentage = totalBoughtSol > 0 ? (profit / totalBoughtSol) * 100 : 0;
       
-      // TODO: Get SOL price in USD
-      const solPriceUsd = 180;
+      const solPriceUsd = await this.getSolPriceUSD();
       
       return {
         projectId,
@@ -445,7 +479,7 @@ export class SwapManager {
         totalBoughtSol,
         totalSoldSol,
         totalVolumeUsd: (totalBoughtSol + totalSoldSol) * solPriceUsd,
-        holdingPercentage: 0, // TODO: Calculate
+        holdingPercentage,
         worthSol,
         worthUsd: worthSol * solPriceUsd,
         profit,
@@ -457,25 +491,65 @@ export class SwapManager {
       throw error;
     }
   }
-  
-  /**
-   * Get pool info (Raydium/Jupiter)
-   * 
-   * TODO: Implement actual pool info fetching
-   */
-  async getPoolInfo(_tokenAddress: string): Promise<PoolInfo | null> {
+
+  private async calculateTokenValue(tokenAmount: number, tokenAddress: string): Promise<number> {
     try {
-      logger.warn('Pool info fetching not implemented');
+      const response = await fetch(`https://price.jup.ag/v4/price?ids=${tokenAddress}`);
+      if (!response.ok) return 0;
       
-      // TODO: Fetch pool info from Raydium/Jupiter
+      const data = await response.json() as JupiterPriceData;
+      if (!data.data || !data.data[tokenAddress]) return 0;
       
-      return null;
+      const priceUsd = data.data[tokenAddress].price;
+      const solPriceUsd = await this.getSolPriceUSD();
+      const priceInSol = priceUsd / solPriceUsd;
+      
+      return tokenAmount * priceInSol;
     } catch (error) {
-      logger.error('Failed to get pool info', { error });
-      return null;
+      logger.error('Failed to calculate token value', { tokenAddress, error });
+      return 0;
+    }
+  }
+
+  private async calculateHoldingPercentage(projectId: number, tokenAddress: string): Promise<number> {
+    try {
+      const tokenMint = new PublicKey(tokenAddress);
+      const supply = await connection.getTokenSupply(tokenMint);
+      const totalSupply = supply.value.uiAmount;
+      
+      if (!totalSupply || totalSupply === 0) return 0;
+      
+      const wallets = await WalletModel.findByProjectId(projectId);
+      let totalProjectBalance = 0;
+      
+      for (const wallet of wallets) {
+        try {
+          const balance = await this.getTokenBalance(wallet.address, tokenAddress);
+          totalProjectBalance += balance;
+        } catch (error) {
+          logger.error('Error getting wallet balance', { walletId: wallet.id, error });
+        }
+      }
+      
+      return (totalProjectBalance / totalSupply) * 100;
+    } catch (error) {
+      logger.error('Failed to calculate holding percentage', { projectId, tokenAddress, error });
+      return 0;
+    }
+  }
+
+  private async getSolPriceUSD(): Promise<number> {
+    try {
+      const response = await fetch(`https://price.jup.ag/v4/price?ids=${this.SOL_MINT}`);
+      if (!response.ok) return 180;
+      
+      const data = await response.json() as JupiterPriceData;
+      return data.data[this.SOL_MINT]?.price || 180;
+    } catch (error) {
+      logger.error('Failed to get SOL price', { error });
+      return 180;
     }
   }
 }
 
-// Export singleton instance
 export default new SwapManager();

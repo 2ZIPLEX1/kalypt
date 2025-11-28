@@ -20,7 +20,7 @@ export class FeeManager {
   
   // TODO: Set production wallet address
   private readonly FEE_WALLET = new PublicKey(
-    'FeeWa11etAddressHereReplaceMeWithRea1Wa11etAddress123'
+    'ySBdM63uedRGavs5gQqb3c5thPCX7uHowdxN3mnTAih'
   );
   
   /**

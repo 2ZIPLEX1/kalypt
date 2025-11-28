@@ -1,15 +1,9 @@
-import { 
-  Keypair, 
-  Transaction, 
-  SystemProgram,
-  VersionedTransaction,
-} from '@solana/web3.js';
+import { Keypair, Transaction, SystemProgram } from '@solana/web3.js';
 import { connection, keypairFromPrivateKey } from '../../utils/solana';
 import { WalletModel } from '../../db/models/wallet';
 import { solToLamports } from '../../constants/solana';
-import config from '../../config';
 import logger from '../../utils/logger';
-import type {
+import {
   WarmupConfig,
   WarmupResult,
   WalletWarmupResult,
@@ -20,58 +14,44 @@ import type {
 } from './types';
 
 /**
- * Jupiter interfaces
- */
-interface JupiterQuoteResponse {
-  inputMint: string;
-  inAmount: string;
-  outputMint: string;
-  outAmount: string;
-  otherAmountThreshold: string;
-  swapMode: string;
-  slippageBps: number;
-  platformFee: null | any;
-  priceImpactPct: string;
-  routePlan: any[];
-}
-
-interface JupiterSwapResponse {
-  swapTransaction: string;
-  lastValidBlockHeight: number;
-}
-
-/**
  * Wallet Warmup Service
  * 
- * Generates natural-looking transaction history to avoid bot detection
+ * Generates natural-looking transaction history to avoid bot detection:
+ * 
+ * Soft Mode:
+ * - Simple SOL transfers between project wallets
+ * - Random amounts and delays
+ * - 5-10 transactions per wallet
+ * 
+ * Hard Mode:
+ * - Multiple transaction types (transfers, swaps, token interactions)
+ * - Variable amounts and delays
+ * - 10-20 transactions per wallet
+ * - More realistic patterns
  */
 export class WalletWarmupService {
-  private readonly JUPITER_QUOTE_API = 'https://quote-api.jup.ag/v6/quote';
-  private readonly JUPITER_SWAP_API = 'https://quote-api.jup.ag/v6/swap';
-  private readonly SOL_MINT = 'So11111111111111111111111111111111111111112';
-  private readonly USDC_MINT = 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v';
-  
   /**
    * Execute wallet warmup
    */
   async warmup(
-    warmupConfig: WarmupConfig,
+    config: WarmupConfig,
     callback?: WarmupProgressCallback
   ): Promise<WarmupResult> {
     const startTime = Date.now();
     
     try {
       logger.info('Starting wallet warmup', {
-        projectId: warmupConfig.projectId,
-        walletCount: warmupConfig.walletIds.length,
-        mode: warmupConfig.mode,
+        projectId: config.projectId,
+        walletCount: config.walletIds.length,
+        mode: config.mode,
       });
       
       const walletResults: WalletWarmupResult[] = [];
       
-      for (const walletId of warmupConfig.walletIds) {
+      // Warmup each wallet
+      for (const walletId of config.walletIds) {
         try {
-          const result = await this.warmupWallet(walletId, warmupConfig, callback);
+          const result = await this.warmupWallet(walletId, config, callback);
           walletResults.push(result);
         } catch (error) {
           logger.error('Wallet warmup failed', { walletId, error });
@@ -88,6 +68,7 @@ export class WalletWarmupService {
         }
       }
       
+      // Calculate totals
       const totalTransactions = walletResults.reduce((sum, r) => sum + r.totalTx, 0);
       const successfulTransactions = walletResults.reduce((sum, r) => sum + r.successfulTx, 0);
       const failedTransactions = walletResults.reduce((sum, r) => sum + r.failedTx, 0);
@@ -112,7 +93,7 @@ export class WalletWarmupService {
         duration,
       };
     } catch (error) {
-      logger.error('Warmup failed', { warmupConfig, error });
+      logger.error('Warmup failed', { config, error });
       throw error;
     }
   }
@@ -122,7 +103,7 @@ export class WalletWarmupService {
    */
   private async warmupWallet(
     walletId: number,
-    warmupConfig: WarmupConfig,
+    config: WarmupConfig,
     callback?: WarmupProgressCallback
   ): Promise<WalletWarmupResult> {
     const wallet = await WalletModel.getWithPrivateKey(walletId);
@@ -133,10 +114,11 @@ export class WalletWarmupService {
     
     const keypair = keypairFromPrivateKey(wallet.private_key);
     
-    const txCount = Math.floor(this.randomInRange(
-      warmupConfig.transactionsPerWallet.min,
-      warmupConfig.transactionsPerWallet.max
-    ));
+    // Determine number of transactions
+    const txCount = this.randomInRange(
+      config.transactionsPerWallet.min,
+      config.transactionsPerWallet.max
+    );
     
     logger.info('Warming up wallet', {
       walletId,
@@ -147,15 +129,18 @@ export class WalletWarmupService {
     const transactions: WarmupTransaction[] = [];
     let totalSpent = 0;
     
+    // Execute transactions
     for (let i = 0; i < txCount; i++) {
       try {
-        const txType = this.selectTxType(warmupConfig);
+        // Select random tx type
+        const txType = this.selectTxType(config);
         
+        // Execute transaction
         const tx = await this.executeWarmupTx(
           keypair,
           wallet.address,
           txType,
-          warmupConfig
+          config
         );
         
         transactions.push(tx);
@@ -164,14 +149,16 @@ export class WalletWarmupService {
           totalSpent += tx.amount;
         }
         
+        // Progress callback
         if (callback) {
           await callback(walletId, (i + 1) / txCount, i + 1, txCount);
         }
         
+        // Random delay before next tx
         if (i < txCount - 1) {
           const delay = this.randomInRange(
-            warmupConfig.delayBetweenTx.min,
-            warmupConfig.delayBetweenTx.max
+            config.delayBetweenTx.min,
+            config.delayBetweenTx.max
           );
           await this.sleep(delay);
         }
@@ -206,18 +193,19 @@ export class WalletWarmupService {
   }
   
   /**
-   * Select transaction type
+   * Select transaction type based on config
    */
-  private selectTxType(warmupConfig: WarmupConfig): WarmupTxType {
-    if (!warmupConfig.txTypes || warmupConfig.txTypes.length === 0) {
-      const types: WarmupTxType[] = warmupConfig.mode === 'soft'
+  private selectTxType(config: WarmupConfig): WarmupTxType {
+    if (!config.txTypes || config.txTypes.length === 0) {
+      // Default types for each mode
+      const types: WarmupTxType[] = config.mode === 'soft'
         ? ['transfer']
         : ['transfer', 'swap', 'token_transfer'];
       
       return types[Math.floor(Math.random() * types.length)];
     }
     
-    return warmupConfig.txTypes[Math.floor(Math.random() * warmupConfig.txTypes.length)];
+    return config.txTypes[Math.floor(Math.random() * config.txTypes.length)];
   }
   
   /**
@@ -227,11 +215,11 @@ export class WalletWarmupService {
     keypair: Keypair,
     fromAddress: string,
     txType: WarmupTxType,
-    warmupConfig: WarmupConfig
+    config: WarmupConfig
   ): Promise<WarmupTransaction> {
     const amount = this.randomInRange(
-      warmupConfig.amountRange.min,
-      warmupConfig.amountRange.max
+      config.amountRange.min,
+      config.amountRange.max
     );
     
     try {
@@ -254,7 +242,7 @@ export class WalletWarmupService {
   }
   
   /**
-   * Execute SOL transfer (to self)
+   * Execute SOL transfer (to self or random address)
    */
   private async executeTransfer(
     keypair: Keypair,
@@ -262,6 +250,7 @@ export class WalletWarmupService {
     amount: number
   ): Promise<WarmupTransaction> {
     try {
+      // Transfer to self (looks like wallet activity)
       const toAddress = keypair.publicKey;
       
       const transaction = new Transaction().add(
@@ -303,168 +292,53 @@ export class WalletWarmupService {
   }
   
   /**
-   * Execute swap (SOL ↔ USDC via Jupiter)
+   * Execute swap (placeholder - requires DEX integration)
    */
   private async executeSwap(
     keypair: Keypair,
     fromAddress: string,
     amount: number
   ): Promise<WarmupTransaction> {
-    try {
-      const buyUsdc = Math.random() > 0.5;
-      const amountLamports = Math.floor(amount * 1e9);
-      
-      const quote = await this.getJupiterQuote(
-        buyUsdc ? this.SOL_MINT : this.USDC_MINT,
-        buyUsdc ? this.USDC_MINT : this.SOL_MINT,
-        amountLamports,
-        50
-      );
-      
-      const swapTxBase64 = await this.getJupiterSwapTransaction(
-        quote,
-        keypair.publicKey.toString()
-      );
-      
-      const swapTxBuffer = Buffer.from(swapTxBase64, 'base64');
-      const transaction = VersionedTransaction.deserialize(swapTxBuffer);
-      
-      transaction.sign([keypair]);
-      
-      const signature = await connection.sendRawTransaction(
-        transaction.serialize(),
-        {
-          skipPreflight: false,
-          preflightCommitment: 'confirmed',
-        }
-      );
-      
-      await connection.confirmTransaction(signature, 'confirmed');
-      
-      logger.info('Warmup swap executed', {
-        address: fromAddress,
-        direction: buyUsdc ? 'SOL→USDC' : 'USDC→SOL',
-        amount,
-      });
-      
-      return {
-        type: 'swap',
-        signature,
-        amount,
-        from: fromAddress,
-        to: buyUsdc ? 'USDC' : 'SOL',
-        success: true,
-        timestamp: new Date(),
-      };
-    } catch (error) {
-      logger.warn('Swap failed, falling back to transfer', {
-        address: fromAddress,
-        error,
-      });
-      
-      return await this.executeTransfer(keypair, fromAddress, amount * 0.1);
-    }
+    // TODO: Implement actual swap through Raydium/Jupiter
+    logger.warn('Swap not implemented, falling back to transfer', {
+      address: fromAddress,
+    });
+    
+    return await this.executeTransfer(keypair, fromAddress, amount);
   }
   
   /**
-   * Execute token transfer (fallback to transfer)
+   * Execute token transfer (placeholder)
    */
   private async executeTokenTransfer(
     keypair: Keypair,
     fromAddress: string,
     amount: number
   ): Promise<WarmupTransaction> {
-    logger.warn('Token transfer not fully implemented, using transfer', {
+    // TODO: Implement token transfer
+    logger.warn('Token transfer not implemented, falling back to transfer', {
       address: fromAddress,
     });
     
-    return await this.executeTransfer(keypair, fromAddress, amount * 0.1);
-  }
-  
-  /**
-   * Get Jupiter quote
-   */
-  private async getJupiterQuote(
-    inputMint: string,
-    outputMint: string,
-    amount: number,
-    slippageBps: number
-  ): Promise<JupiterQuoteResponse> {
-    try {
-      const params = new URLSearchParams({
-        inputMint,
-        outputMint,
-        amount: amount.toString(),
-        slippageBps: (slippageBps * 100).toString(),
-        onlyDirectRoutes: 'false',
-        asLegacyTransaction: 'false',
-      });
-      
-      const response = await fetch(`${this.JUPITER_QUOTE_API}?${params}`);
-      
-      if (!response.ok) {
-        const error = await response.text();
-        throw new Error(`Jupiter quote failed: ${error}`);
-      }
-      
-      return await response.json() as JupiterQuoteResponse;
-    } catch (error) {
-      logger.error('Failed to get Jupiter quote', { error });
-      throw error;
-    }
-  }
-  
-  /**
-   * Get Jupiter swap transaction
-   */
-  private async getJupiterSwapTransaction(
-    quoteResponse: JupiterQuoteResponse,
-    userPublicKey: string
-  ): Promise<string> {
-    try {
-      const response = await fetch(this.JUPITER_SWAP_API, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          quoteResponse,
-          userPublicKey,
-          wrapAndUnwrapSol: true,
-          computeUnitPriceMicroLamports: config.compute.unitPrice,
-          dynamicComputeUnitLimit: true,
-        }),
-      });
-      
-      if (!response.ok) {
-        const error = await response.text();
-        throw new Error(`Jupiter swap transaction failed: ${error}`);
-      }
-      
-      const data = await response.json() as JupiterSwapResponse;
-      return data.swapTransaction;
-    } catch (error) {
-      logger.error('Failed to get Jupiter swap transaction', { error });
-      throw error;
-    }
+    return await this.executeTransfer(keypair, fromAddress, amount);
   }
   
   /**
    * Calculate warmup stats
    */
-  async calculateStats(warmupConfig: WarmupConfig): Promise<WarmupStats> {
-    const avgTx = (warmupConfig.transactionsPerWallet.min + warmupConfig.transactionsPerWallet.max) / 2;
-    const avgAmount = (warmupConfig.amountRange.min + warmupConfig.amountRange.max) / 2;
-    const avgDelay = (warmupConfig.delayBetweenTx.min + warmupConfig.delayBetweenTx.max) / 2;
+  async calculateStats(config: WarmupConfig): Promise<WarmupStats> {
+    const avgTx = (config.transactionsPerWallet.min + config.transactionsPerWallet.max) / 2;
+    const avgAmount = (config.amountRange.min + config.amountRange.max) / 2;
+    const avgDelay = (config.delayBetweenTx.min + config.delayBetweenTx.max) / 2;
     
-    const totalWallets = warmupConfig.walletIds.length;
+    const totalWallets = config.walletIds.length;
     const totalTx = totalWallets * avgTx;
     const totalSpent = totalTx * avgAmount;
     const estimatedTime = totalTx * avgDelay;
     
     return {
       totalWallets,
-      warmedWallets: 0,
+      warmedWallets: 0, // Will be updated after warmup
       averageTxPerWallet: avgTx,
       totalSpent,
       estimatedTime,
@@ -486,6 +360,8 @@ export class WalletWarmupService {
   }
 }
 
+// Export singleton instance
 export default new WalletWarmupService();
 
+// Export types
 export * from './types';

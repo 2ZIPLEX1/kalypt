@@ -7,11 +7,11 @@ export type WarmupMode = 'soft' | 'hard';
  * Warmup transaction type
  */
 export type WarmupTxType = 
-  | 'transfer'
-  | 'swap'
-  | 'token_transfer'
-  | 'nft_interaction'
-  | 'random';
+  | 'transfer'      // SOL transfer between wallets
+  | 'swap'          // Token swap (SOL ↔ USDC)
+  | 'token_transfer' // Token transfer
+  | 'nft_interaction' // NFT mint/transfer
+  | 'random';       // Random activity
 
 /**
  * Warmup configuration
@@ -25,14 +25,14 @@ export interface WarmupConfig {
     max: number;
   };
   amountRange: {
-    min: number;
-    max: number;
+    min: number; // SOL
+    max: number; // SOL
   };
   delayBetweenTx: {
-    min: number;
-    max: number;
+    min: number; // seconds
+    max: number; // seconds
   };
-  txTypes?: WarmupTxType[];
+  txTypes?: WarmupTxType[]; // If not specified, uses random
 }
 
 /**
@@ -44,7 +44,7 @@ export interface WarmupResult {
   successfulTransactions: number;
   failedTransactions: number;
   totalSpent: number;
-  duration: number;
+  duration: number; // milliseconds
 }
 
 /**
@@ -92,5 +92,5 @@ export interface WarmupStats {
   warmedWallets: number;
   averageTxPerWallet: number;
   totalSpent: number;
-  estimatedTime: number;
+  estimatedTime: number; // seconds
 }

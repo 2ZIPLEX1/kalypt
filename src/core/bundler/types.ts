@@ -1,4 +1,4 @@
-import { Transaction } from '@solana/web3.js';
+import { VersionedTransaction } from '@solana/web3.js';
 
 /**
  * Bundle type
@@ -13,7 +13,7 @@ export interface BundleConfig {
   walletIds: number[];
   tokenAddress: string;
   type: BundleType;
-  amountPerWallet?: number; // SOL per wallet for buy
+  amountPerWallet?: number;
   jitoTipLamports?: number;
   maxRetries?: number;
 }
@@ -23,7 +23,7 @@ export interface BundleConfig {
  */
 export interface BundleTransaction {
   walletId: number;
-  transaction: Transaction;
+  transaction: VersionedTransaction;
   description: string;
 }
 
@@ -54,7 +54,7 @@ export interface BundleTransactionResult {
  */
 export interface JitoBundleResponse {
   jsonrpc: string;
-  result: string; // Bundle ID
+  result: string;
   id: number;
 }
 
@@ -93,7 +93,7 @@ export interface BundleSellConfig {
   projectId: number;
   tokenAddress: string;
   walletIds: number[];
-  percentage: number; // 0-100
+  percentage: number;
   slippage?: number;
   jitoTip?: number;
 }
