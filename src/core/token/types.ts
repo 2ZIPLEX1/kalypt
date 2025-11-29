@@ -1,96 +1,83 @@
-/**
- * Warmup mode
- */
-export type WarmupMode = 'soft' | 'hard';
+import { PublicKey } from '@solana/web3.js';
 
 /**
- * Warmup transaction type
+ * Token deployment options
  */
-export type WarmupTxType = 
-  | 'transfer'
-  | 'swap'
-  | 'token_transfer'
-  | 'nft_interaction'
-  | 'random';
-
-/**
- * Warmup configuration
- */
-export interface WarmupConfig {
+export interface TokenDeployOptions {
   projectId: number;
-  walletIds: number[];
-  mode: WarmupMode;
-  transactionsPerWallet: {
-    min: number;
-    max: number;
-  };
-  amountRange: {
-    min: number;
-    max: number;
-  };
-  delayBetweenTx: {
-    min: number;
-    max: number;
-  };
-  txTypes?: WarmupTxType[];
+  name: string;
+  symbol: string;
+  description?: string;
+  imageUrl?: string;
+  website?: string;
+  twitter?: string;
+  telegram?: string;
+  initialLiquiditySol?: number;
 }
 
 /**
- * Warmup result
+ * Token metadata for IPFS
  */
-export interface WarmupResult {
-  walletResults: WalletWarmupResult[];
-  totalTransactions: number;
-  successfulTransactions: number;
-  failedTransactions: number;
-  totalSpent: number;
-  duration: number;
+export interface TokenMetadataIPFS {
+  name: string;
+  symbol: string;
+  description: string;
+  image: string;
+  showName: boolean;
+  createdOn: string;
+  twitter?: string;
+  telegram?: string;
+  website?: string;
 }
 
 /**
- * Wallet warmup result
+ * Token deployment result
  */
-export interface WalletWarmupResult {
-  walletId: number;
-  address: string;
-  transactions: WarmupTransaction[];
-  totalTx: number;
-  successfulTx: number;
-  failedTx: number;
-  totalSpent: number;
-}
-
-/**
- * Warmup transaction
- */
-export interface WarmupTransaction {
-  type: WarmupTxType;
+export interface TokenDeployResult {
+  tokenAddress: string;
   signature: string;
-  amount: number;
-  from: string;
-  to: string;
-  success: boolean;
-  error?: string;
-  timestamp: Date;
+  metadataUri?: string;
+  bondingCurve?: string;
+  associatedBondingCurve?: string;
 }
 
 /**
- * Warmup progress callback
+ * Pump.fun create params
  */
-export type WarmupProgressCallback = (
-  walletId: number,
-  progress: number,
-  currentTx: number,
-  totalTx: number
-) => void | Promise<void>;
+export interface PumpFunCreateParams {
+  name: string;
+  symbol: string;
+  uri: string;
+  mint: PublicKey;
+}
 
 /**
- * Warmup stats
+ * Token creation transaction
  */
-export interface WarmupStats {
-  totalWallets: number;
-  warmedWallets: number;
-  averageTxPerWallet: number;
-  totalSpent: number;
-  estimatedTime: number;
+export interface TokenCreationTx {
+  mint: PublicKey;
+  bondingCurve: PublicKey;
+  associatedBondingCurve: PublicKey;
+  metadata: PublicKey;
+  instructions: any[];
+}
+
+/**
+ * IPFS upload result
+ */
+export interface IPFSUploadResult {
+  uri: string;
+  metadata: TokenMetadataIPFS;
+}
+
+/**
+ * Token info from blockchain
+ */
+export interface TokenInfo {
+  mint: string;
+  name: string;
+  symbol: string;
+  decimals: number;
+  supply: number;
+  metadataUri?: string;
 }

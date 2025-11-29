@@ -10,10 +10,6 @@ import {
   AddressLookupTableProgram,
   AddressLookupTableAccount,
 } from '@solana/web3.js';
-import {
-  getAssociatedTokenAddress,
-  createAssociatedTokenAccountInstruction,
-} from '@solana/spl-token';
 import bs58 from 'bs58';
 import config from '../config';
 import logger from './logger';
@@ -109,6 +105,29 @@ export async function getBalance(
 }
 
 /**
+ * Manual implementation of getAssociatedTokenAddress
+ * (for compatibility with old @solana/spl-token versions)
+ */
+export async function getAssociatedTokenAddressManual(
+  mint: PublicKey,
+  owner: PublicKey,
+  allowOwnerOffCurve: boolean = false,
+  programId: PublicKey = new PublicKey('TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA'),
+  associatedTokenProgramId: PublicKey = new PublicKey('ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL')
+): Promise<PublicKey> {
+  if (!allowOwnerOffCurve && !PublicKey.isOnCurve(owner.toBuffer())) {
+    throw new Error('Owner cannot be off curve');
+  }
+
+  const [address] = await PublicKey.findProgramAddress(
+    [owner.toBuffer(), programId.toBuffer(), mint.toBuffer()],
+    associatedTokenProgramId
+  );
+
+  return address;
+}
+
+/**
  * Get token balance for address
  */
 export async function getTokenBalance(
@@ -117,7 +136,7 @@ export async function getTokenBalance(
   conn?: Connection
 ): Promise<number> {
   try {
-    const ata = await getAssociatedTokenAddress(
+    const ata = await getAssociatedTokenAddressManual(
       tokenMintAddress,
       walletAddress
     );
@@ -225,50 +244,6 @@ export function addComputeBudget(
 }
 
 /**
- * Get or create associated token account
- */
-export async function getOrCreateAssociatedTokenAccount(
-  payer: Keypair,
-  mint: PublicKey,
-  owner: PublicKey,
-  conn?: Connection
-): Promise<PublicKey> {
-  const ata = await getAssociatedTokenAddress(mint, owner);
-  
-  // Check if account exists
-  const accountInfo = await (conn || connection).getAccountInfo(ata);
-  
-  if (accountInfo) {
-    return ata;
-  }
-  
-  // Create account
-  const transaction = new Transaction().add(
-    createAssociatedTokenAccountInstruction(
-      payer.publicKey,
-      ata,
-      owner,
-      mint
-    )
-  );
-  
-  await sendAndConfirmTransaction(
-    conn || connection,
-    transaction,
-    [payer],
-    { commitment: 'confirmed' }
-  );
-  
-  logger.info('Created associated token account', {
-    ata: ata.toString(),
-    mint: mint.toString(),
-    owner: owner.toString(),
-  });
-  
-  return ata;
-}
-
-/**
  * Create Address Lookup Table
  */
 export async function createLookupTable(
@@ -284,7 +259,6 @@ export async function createLookupTable(
         recentSlot: await (conn || connection).getSlot(),
       });
     
-    // Create the lookup table
     const transaction = new Transaction().add(lookupTableInstruction);
     
     await sendAndConfirmTransaction(
@@ -298,10 +272,8 @@ export async function createLookupTable(
       address: lookupTableAddress.toString(),
     });
     
-    // Wait for table to be active
     await sleep(2000);
     
-    // Extend the lookup table with addresses
     if (addresses.length > 0) {
       await extendLookupTable(
         lookupTableAddress,
@@ -328,7 +300,6 @@ export async function extendLookupTable(
   conn?: Connection
 ): Promise<void> {
   try {
-    // Split addresses into chunks of 20 (max per transaction)
     const chunks = [];
     for (let i = 0; i < addresses.length; i += 20) {
       chunks.push(addresses.slice(i, i + 20));
@@ -356,7 +327,6 @@ export async function extendLookupTable(
         addedAddresses: chunk.length,
       });
       
-      // Small delay between extensions
       await sleep(500);
     }
     
@@ -514,7 +484,6 @@ export async function batchTransferSOL(
       );
       signatures.push(signature);
       
-      // Small delay between transfers
       await sleep(500);
     } catch (error) {
       logger.error('Batch transfer failed for recipient', {

@@ -1,9 +1,8 @@
 import {
   Keypair,
-  Transaction,
   VersionedTransaction,
+  TransactionMessage,
   SystemProgram,
-  ComputeBudgetProgram,
   PublicKey,
 } from '@solana/web3.js';
 import { connection, keypairFromPrivateKey } from '../../utils/solana';
@@ -12,7 +11,7 @@ import { TransactionModel } from '../../db/models/transaction';
 import { JITO_TIP_ACCOUNTS, JITO_BUNDLE_CONFIG } from '../../constants/jito';
 import config from '../../config';
 import logger from '../../utils/logger';
-import {
+import type {
   BundleConfig,
   BundleTransaction,
   BundleResult,
@@ -41,21 +40,12 @@ interface JupiterQuoteResponse {
 }
 
 interface JupiterSwapResponse {
-  swapTransaction: string; // Base64 encoded
+  swapTransaction: string;
   lastValidBlockHeight: number;
 }
 
 /**
  * Bundle Creator
- * 
- * Handles Jito bundle operations for atomic transaction execution:
- * - Bundle buy (multiple wallets buy simultaneously)
- * - Bundle sell (multiple wallets sell simultaneously)
- * - Anti-MEV protection
- * - Smart wallet selection
- * - Bundle status tracking
- * 
- * Jito bundles ensure all transactions execute atomically or none execute.
  */
 export class BundleCreator {
   private readonly JITO_ENDPOINTS = [
@@ -72,20 +62,12 @@ export class BundleCreator {
   
   private currentEndpointIndex = 0;
   
-  /**
-   * Get current Jito endpoint (with rotation)
-   */
   private getJitoEndpoint(): string {
     const endpoint = this.JITO_ENDPOINTS[this.currentEndpointIndex];
     this.currentEndpointIndex = (this.currentEndpointIndex + 1) % this.JITO_ENDPOINTS.length;
     return endpoint;
   }
   
-  /**
-   * Execute bundle buy
-   * 
-   * All wallets buy simultaneously in one atomic bundle
-   */
   async executeBundleBuy(bundleConfig: BundleBuyConfig): Promise<BundleResult> {
     try {
       logger.info('Starting bundle buy', {
@@ -94,29 +76,6 @@ export class BundleCreator {
         amountPerWallet: bundleConfig.amountPerWallet,
       });
       
-      // Build buy transactions for each wallet
-      const bundleTxs: BundleTransaction[] = [];
-      
-      for (const walletId of bundleConfig.walletIds) {
-        try {
-          const tx = await this.buildBuyTransaction(
-            walletId,
-            bundleConfig.tokenAddress,
-            bundleConfig.amountPerWallet,
-            bundleConfig.slippage
-          );
-          
-          bundleTxs.push(tx);
-        } catch (error) {
-          logger.error('Failed to build buy transaction', { walletId, error });
-        }
-      }
-      
-      if (bundleTxs.length === 0) {
-        throw new Error('No valid transactions to bundle');
-      }
-      
-      // Execute bundle
       return await this.executeBundle({
         projectId: bundleConfig.projectId,
         walletIds: bundleConfig.walletIds,
@@ -131,9 +90,6 @@ export class BundleCreator {
     }
   }
   
-  /**
-   * Execute bundle sell
-   */
   async executeBundleSell(bundleConfig: BundleSellConfig): Promise<BundleResult> {
     try {
       logger.info('Starting bundle sell', {
@@ -142,29 +98,6 @@ export class BundleCreator {
         percentage: bundleConfig.percentage,
       });
       
-      // Build sell transactions
-      const bundleTxs: BundleTransaction[] = [];
-      
-      for (const walletId of bundleConfig.walletIds) {
-        try {
-          const tx = await this.buildSellTransaction(
-            walletId,
-            bundleConfig.tokenAddress,
-            bundleConfig.percentage,
-            bundleConfig.slippage
-          );
-          
-          bundleTxs.push(tx);
-        } catch (error) {
-          logger.error('Failed to build sell transaction', { walletId, error });
-        }
-      }
-      
-      if (bundleTxs.length === 0) {
-        throw new Error('No valid transactions to bundle');
-      }
-      
-      // Execute bundle
       return await this.executeBundle({
         projectId: bundleConfig.projectId,
         walletIds: bundleConfig.walletIds,
@@ -178,12 +111,8 @@ export class BundleCreator {
     }
   }
   
-  /**
-   * Execute bundle
-   */
   private async executeBundle(bundleConfig: BundleConfig): Promise<BundleResult> {
     try {
-      // Build transactions
       const transactions: VersionedTransaction[] = [];
       const walletKeypairs: Keypair[] = [];
       
@@ -198,70 +127,60 @@ export class BundleCreator {
         const keypair = keypairFromPrivateKey(wallet.private_key);
         walletKeypairs.push(keypair);
         
-        // Build transaction based on type
-        let tx: VersionedTransaction;
+        let bundleTx: BundleTransaction;
         
         if (bundleConfig.type === 'buy') {
-          const bundleTx = await this.buildBuyTransaction(
+          bundleTx = await this.buildBuyTransaction(
             walletId,
             bundleConfig.tokenAddress,
             bundleConfig.amountPerWallet || 0,
             15
           );
-          tx = bundleTx.transaction;
         } else {
-          const bundleTx = await this.buildSellTransaction(
+          bundleTx = await this.buildSellTransaction(
             walletId,
             bundleConfig.tokenAddress,
-            100, // Full balance
+            100,
             15
           );
-          tx = bundleTx.transaction;
         }
         
-        transactions.push(tx);
+        transactions.push(bundleTx.transaction);
       }
       
       if (transactions.length === 0) {
         throw new Error('No valid transactions to bundle');
       }
       
-      // Add Jito tip to last transaction
       const tipAmount = bundleConfig.jitoTipLamports || JITO_BUNDLE_CONFIG.DEFAULT_TIP;
-      await this.addJitoTipToTransaction(
-        transactions[transactions.length - 1],
+      const tipTx = await this.createJitoTipTransaction(
         walletKeypairs[walletKeypairs.length - 1],
         tipAmount
       );
       
-      // Sign all transactions
       for (let i = 0; i < transactions.length; i++) {
         transactions[i].sign([walletKeypairs[i]]);
       }
       
-      // Send bundle to Jito
+      tipTx.sign([walletKeypairs[walletKeypairs.length - 1]]);
+      transactions.push(tipTx);
+      
       logger.info('Sending bundle to Jito', {
         transactionCount: transactions.length,
         tipAmount,
       });
       
       const bundleId = await this.sendBundle(transactions);
-      
       logger.info('Bundle sent', { bundleId });
       
-      // Wait for bundle confirmation
       const confirmed = await this.waitForBundleConfirmation(bundleId);
       
       if (!confirmed) {
         throw new Error('Bundle confirmation timeout');
       }
       
-      // Get transaction signatures
-      const signatures = transactions.map((tx, i) => {
-        return `bundle_${bundleId}_tx${i}`;
-      });
+      const signatures = transactions.map((_tx, i) => `bundle_${bundleId}_tx${i}`);
       
-      // Save transactions to DB
       for (let i = 0; i < bundleConfig.walletIds.length; i++) {
         await TransactionModel.create({
           project_id: bundleConfig.projectId,
@@ -275,7 +194,7 @@ export class BundleCreator {
         });
       }
       
-      const details: BundleTransactionResult[] = bundleConfig.walletIds.map((walletId, i) => ({
+      const details: BundleTransactionResult[] = bundleConfig.walletIds.map((walletId: number, i: number) => ({
         walletId,
         signature: signatures[i],
         success: true,
@@ -300,9 +219,43 @@ export class BundleCreator {
     }
   }
   
-  /**
-   * Build buy transaction using Jupiter
-   */
+  private async createJitoTipTransaction(
+    payer: Keypair,
+    tipLamports: number
+  ): Promise<VersionedTransaction> {
+    try {
+      const tipAccount = JITO_TIP_ACCOUNTS[
+        Math.floor(Math.random() * JITO_TIP_ACCOUNTS.length)
+      ];
+      
+      const tipInstruction = SystemProgram.transfer({
+        fromPubkey: payer.publicKey,
+        toPubkey: tipAccount,
+        lamports: tipLamports,
+      });
+      
+      const { blockhash } = await connection.getLatestBlockhash();
+      
+      const messageV0 = new TransactionMessage({
+        payerKey: payer.publicKey,
+        recentBlockhash: blockhash,
+        instructions: [tipInstruction],
+      }).compileToV0Message();
+      
+      const versionedTx = new VersionedTransaction(messageV0);
+      
+      logger.info('Jito tip transaction created', {
+        tipAccount: tipAccount.toString(),
+        tipLamports,
+      });
+      
+      return versionedTx;
+    } catch (error) {
+      logger.error('Failed to create Jito tip transaction', { error });
+      throw error;
+    }
+  }
+  
   private async buildBuyTransaction(
     walletId: number,
     tokenAddress: string,
@@ -318,7 +271,6 @@ export class BundleCreator {
     const keypair = keypairFromPrivateKey(wallet.private_key);
     
     try {
-      // Get Jupiter quote for SOL -> Token
       const amountLamports = Math.floor(amountSol * 1e9);
       
       const quote = await this.getJupiterQuote(
@@ -328,15 +280,13 @@ export class BundleCreator {
         slippage || 15
       );
       
-      // Get swap transaction
       const swapTxBase64 = await this.getJupiterSwapTransaction(
         quote,
         keypair.publicKey.toString()
       );
       
-      // Deserialize transaction
       const swapTxBuffer = Buffer.from(swapTxBase64, 'base64');
-      const transaction = VersionedTransaction.deserialize(swapTxBuffer);
+      const versionedTx = VersionedTransaction.deserialize(swapTxBuffer);
       
       logger.info('Buy transaction built', {
         walletId,
@@ -346,7 +296,7 @@ export class BundleCreator {
       
       return {
         walletId,
-        transaction,
+        transaction: versionedTx,
         description: `Buy ${amountSol} SOL worth of ${tokenAddress}`,
       };
     } catch (error) {
@@ -355,9 +305,6 @@ export class BundleCreator {
     }
   }
   
-  /**
-   * Build sell transaction using Jupiter
-   */
   private async buildSellTransaction(
     walletId: number,
     tokenAddress: string,
@@ -373,7 +320,6 @@ export class BundleCreator {
     const keypair = keypairFromPrivateKey(wallet.private_key);
     
     try {
-      // Get token balance
       const tokenBalance = await this.getTokenBalance(
         keypair.publicKey,
         new PublicKey(tokenAddress)
@@ -383,11 +329,9 @@ export class BundleCreator {
         throw new Error('No token balance to sell');
       }
       
-      // Calculate amount to sell
       const amountToSell = (tokenBalance * percentage) / 100;
-      const amountBaseUnits = Math.floor(amountToSell * Math.pow(10, 6)); // Assuming 6 decimals
+      const amountBaseUnits = Math.floor(amountToSell * Math.pow(10, 6));
       
-      // Get Jupiter quote for Token -> SOL
       const quote = await this.getJupiterQuote(
         tokenAddress,
         this.SOL_MINT,
@@ -395,15 +339,13 @@ export class BundleCreator {
         slippage || 15
       );
       
-      // Get swap transaction
       const swapTxBase64 = await this.getJupiterSwapTransaction(
         quote,
         keypair.publicKey.toString()
       );
       
-      // Deserialize transaction
       const swapTxBuffer = Buffer.from(swapTxBase64, 'base64');
-      const transaction = VersionedTransaction.deserialize(swapTxBuffer);
+      const versionedTx = VersionedTransaction.deserialize(swapTxBuffer);
       
       logger.info('Sell transaction built', {
         walletId,
@@ -413,7 +355,7 @@ export class BundleCreator {
       
       return {
         walletId,
-        transaction,
+        transaction: versionedTx,
         description: `Sell ${percentage}% of ${tokenAddress}`,
       };
     } catch (error) {
@@ -422,9 +364,6 @@ export class BundleCreator {
     }
   }
   
-  /**
-   * Get Jupiter quote
-   */
   private async getJupiterQuote(
     inputMint: string,
     outputMint: string,
@@ -436,7 +375,7 @@ export class BundleCreator {
         inputMint,
         outputMint,
         amount: amount.toString(),
-        slippageBps: (slippageBps * 100).toString(), // Convert % to bps
+        slippageBps: (slippageBps * 100).toString(),
         onlyDirectRoutes: 'false',
         asLegacyTransaction: 'false',
       });
@@ -455,9 +394,6 @@ export class BundleCreator {
     }
   }
   
-  /**
-   * Get Jupiter swap transaction
-   */
   private async getJupiterSwapTransaction(
     quoteResponse: JupiterQuoteResponse,
     userPublicKey: string
@@ -490,9 +426,6 @@ export class BundleCreator {
     }
   }
   
-  /**
-   * Get token balance
-   */
   private async getTokenBalance(
     walletPubkey: PublicKey,
     tokenMint: PublicKey
@@ -520,39 +453,14 @@ export class BundleCreator {
     }
   }
   
-  /**
-   * Add Jito tip to transaction
-   */
-  private async addJitoTipToTransaction(
-    transaction: VersionedTransaction,
-    _payer: Keypair,
-    tipLamports: number
-  ): Promise<void> {
-    // Note: Adding tip to VersionedTransaction is complex
-    // Typically done by modifying the transaction before serialization
-    // For now, we'll log and skip actual implementation
-    
-    logger.warn('Jito tip addition to VersionedTransaction not fully implemented', {
-      tipLamports,
-    });
-    
-    // TODO: Properly add tip instruction to VersionedTransaction
-    // This requires reconstructing the transaction with the tip instruction
-  }
-  
-  /**
-   * Send bundle to Jito
-   */
   private async sendBundle(transactions: VersionedTransaction[]): Promise<string> {
     try {
       const endpoint = this.getJitoEndpoint();
       
-      // Serialize transactions
       const serializedTxs = transactions.map(tx => 
         Buffer.from(tx.serialize()).toString('base64')
       );
       
-      // Send to Jito
       const response = await fetch(`${endpoint}/api/v1/bundles`, {
         method: 'POST',
         headers: {
@@ -583,9 +491,6 @@ export class BundleCreator {
     }
   }
   
-  /**
-   * Wait for bundle confirmation
-   */
   private async waitForBundleConfirmation(
     bundleId: string,
     maxAttempts: number = 30
@@ -615,7 +520,6 @@ export class BundleCreator {
           }
         }
         
-        // Wait 2 seconds before retry
         await new Promise(resolve => setTimeout(resolve, 2000));
       } catch (error) {
         logger.error('Failed to check bundle status', { bundleId, error });
@@ -626,9 +530,6 @@ export class BundleCreator {
     return false;
   }
   
-  /**
-   * Get bundle status from Jito
-   */
   private async getBundleStatus(bundleId: string): Promise<JitoBundleStatus | null> {
     try {
       const endpoint = this.getJitoEndpoint();
@@ -658,24 +559,15 @@ export class BundleCreator {
     }
   }
   
-  /**
-   * Smart bundle selection
-   * 
-   * Selects best wallets for bundle based on balance
-   */
   async selectWalletsForBundle(
     projectId: number,
     targetAmount: number,
     maxWallets: number = 15
   ): Promise<SmartBundleSelection> {
     try {
-      // Get all project wallets
       const wallets = await WalletModel.findByProjectId(projectId);
-      
-      // Filter bundle wallets with balance
       const bundleWallets = wallets.filter(w => w.wallet_type === 'bundle');
       
-      // Get balances
       const walletsWithBalance = await Promise.all(
         bundleWallets.map(async (w) => {
           const balance = await connection.getBalance(
@@ -688,13 +580,10 @@ export class BundleCreator {
         })
       );
       
-      // Sort by balance descending
       walletsWithBalance.sort((a, b) => b.balance - a.balance);
       
-      // Select top wallets
       const selected = walletsWithBalance.slice(0, maxWallets);
       
-      // Calculate allocation (80% of balance per wallet)
       const utilizationPercent = 80;
       const allocations = selected.map(w => ({
         walletId: w.id,
@@ -720,5 +609,4 @@ export class BundleCreator {
   }
 }
 
-// Export singleton instance
 export default new BundleCreator();

@@ -1,491 +1,373 @@
-import { 
-  Keypair, 
-  Transaction, 
-  SystemProgram,
-  VersionedTransaction,
-} from '@solana/web3.js';
-import { connection, keypairFromPrivateKey } from '../../utils/solana';
+import { Keypair, PublicKey } from '@solana/web3.js';
+import { connection } from '../../utils/solana';
 import { WalletModel } from '../../db/models/wallet';
-import { solToLamports } from '../../constants/solana';
-import config from '../../config';
+import { keypairFromPrivateKey } from '../../utils/solana';
+import ProjectManager from '../project';
 import logger from '../../utils/logger';
-import type {
-  WarmupConfig,
-  WarmupResult,
-  WalletWarmupResult,
-  WarmupTransaction,
-  WarmupTxType,
-  WarmupProgressCallback,
-  WarmupStats,
+import {
+  TokenDeployOptions,
+  TokenDeployResult,
+  TokenMetadataIPFS,
+  IPFSUploadResult,
+  TokenInfo,
 } from './types';
 
 /**
- * Jupiter interfaces
- */
-interface JupiterQuoteResponse {
-  inputMint: string;
-  inAmount: string;
-  outputMint: string;
-  outAmount: string;
-  otherAmountThreshold: string;
-  swapMode: string;
-  slippageBps: number;
-  platformFee: null | any;
-  priceImpactPct: string;
-  routePlan: any[];
-}
-
-interface JupiterSwapResponse {
-  swapTransaction: string;
-  lastValidBlockHeight: number;
-}
-
-/**
- * Wallet Warmup Service
+ * Token Deployer
  * 
- * Generates natural-looking transaction history to avoid bot detection
+ * Handles token deployment on Pump.fun:
+ * - Upload metadata to IPFS
+ * - Create token on Pump.fun
+ * - Get contract address (CA)
+ * - Link to project
+ * 
+ * Platform: Pump.fun (Solana)
  */
-export class WalletWarmupService {
-  private readonly JUPITER_QUOTE_API = 'https://quote-api.jup.ag/v6/quote';
-  private readonly JUPITER_SWAP_API = 'https://quote-api.jup.ag/v6/swap';
-  private readonly SOL_MINT = 'So11111111111111111111111111111111111111112';
-  private readonly USDC_MINT = 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v';
-  
+export class TokenDeployer {
   /**
-   * Execute wallet warmup
+   * Deploy token on Pump.fun
+   * 
+   * Flow:
+   * 1. Get project dev wallet
+   * 2. Prepare metadata
+   * 3. Upload to IPFS
+   * 4. Create token on Pump.fun
+   * 5. Save CA to project
    */
-  async warmup(
-    warmupConfig: WarmupConfig,
-    callback?: WarmupProgressCallback
-  ): Promise<WarmupResult> {
-    const startTime = Date.now();
-    
+  async deployToken(options: TokenDeployOptions): Promise<TokenDeployResult> {
     try {
-      logger.info('Starting wallet warmup', {
-        projectId: warmupConfig.projectId,
-        walletCount: warmupConfig.walletIds.length,
-        mode: warmupConfig.mode,
+      logger.info('Starting token deployment', {
+        projectId: options.projectId,
+        name: options.name,
+        symbol: options.symbol,
       });
       
-      const walletResults: WalletWarmupResult[] = [];
+      // 1. Get project and dev wallet
+      const project = await ProjectManager.getProject(options.projectId);
       
-      for (const walletId of warmupConfig.walletIds) {
-        try {
-          const result = await this.warmupWallet(walletId, warmupConfig, callback);
-          walletResults.push(result);
-        } catch (error) {
-          logger.error('Wallet warmup failed', { walletId, error });
-          
-          walletResults.push({
-            walletId,
-            address: '',
-            transactions: [],
-            totalTx: 0,
-            successfulTx: 0,
-            failedTx: 0,
-            totalSpent: 0,
-          });
-        }
+      if (!project) {
+        throw new Error('Project not found');
       }
       
-      const totalTransactions = walletResults.reduce((sum, r) => sum + r.totalTx, 0);
-      const successfulTransactions = walletResults.reduce((sum, r) => sum + r.successfulTx, 0);
-      const failedTransactions = walletResults.reduce((sum, r) => sum + r.failedTx, 0);
-      const totalSpent = walletResults.reduce((sum, r) => sum + r.totalSpent, 0);
+      // Get dev wallet (creator wallet)
+      const wallets = await WalletModel.findByProjectId(options.projectId);
+      const devWallet = wallets.find(w => w.wallet_type === 'dev');
       
-      const duration = Date.now() - startTime;
+      if (!devWallet) {
+        throw new Error('Dev wallet not found. Create a dev wallet first.');
+      }
       
-      logger.info('Wallet warmup complete', {
-        totalTransactions,
-        successfulTransactions,
-        failedTransactions,
-        totalSpent,
-        duration: `${duration}ms`,
+      // Get wallet keypair
+      const walletWithKey = await WalletModel.getWithPrivateKey(devWallet.id);
+      
+      if (!walletWithKey || !walletWithKey.private_key) {
+        throw new Error('Cannot decrypt dev wallet');
+      }
+      
+      const creatorKeypair = keypairFromPrivateKey(walletWithKey.private_key);
+      
+      // 2. Prepare metadata
+      const metadata = this.prepareMetadata(options);
+      
+      // 3. Upload to IPFS
+      logger.info('Uploading metadata to IPFS...');
+      const ipfsResult = await this.uploadToIPFS(metadata, options.imageUrl);
+      
+      logger.info('Metadata uploaded', { uri: ipfsResult.uri });
+      
+      // 4. Create token on Pump.fun
+      logger.info('Creating token on Pump.fun...');
+      const deployResult = await this.createTokenOnPumpFun(
+        creatorKeypair,
+        options.name,
+        options.symbol,
+        ipfsResult.uri
+      );
+      
+      logger.info('Token created', {
+        tokenAddress: deployResult.tokenAddress,
+        signature: deployResult.signature,
+      });
+      
+      // 5. Save CA to project
+      await ProjectManager.setTokenAddress(options.projectId, deployResult.tokenAddress);
+      
+      // Update metadata in project
+      await ProjectManager.updateMetadata(options.projectId, {
+        name: options.name,
+        symbol: options.symbol,
+        description: options.description,
+        image: options.imageUrl,
+        website: options.website,
+        twitter: options.twitter,
+        telegram: options.telegram,
+      });
+      
+      logger.info('Token deployment complete', {
+        projectId: options.projectId,
+        tokenAddress: deployResult.tokenAddress,
       });
       
       return {
-        walletResults,
-        totalTransactions,
-        successfulTransactions,
-        failedTransactions,
-        totalSpent,
-        duration,
+        ...deployResult,
+        metadataUri: ipfsResult.uri,
       };
     } catch (error) {
-      logger.error('Warmup failed', { warmupConfig, error });
+      logger.error('Token deployment failed', { options, error });
       throw error;
     }
   }
   
   /**
-   * Warmup single wallet
+   * Prepare metadata for IPFS
    */
-  private async warmupWallet(
-    walletId: number,
-    warmupConfig: WarmupConfig,
-    callback?: WarmupProgressCallback
-  ): Promise<WalletWarmupResult> {
-    const wallet = await WalletModel.getWithPrivateKey(walletId);
-    
-    if (!wallet || !wallet.private_key) {
-      throw new Error('Cannot decrypt wallet');
-    }
-    
-    const keypair = keypairFromPrivateKey(wallet.private_key);
-    
-    const txCount = Math.floor(this.randomInRange(
-      warmupConfig.transactionsPerWallet.min,
-      warmupConfig.transactionsPerWallet.max
-    ));
-    
-    logger.info('Warming up wallet', {
-      walletId,
-      address: wallet.address,
-      txCount,
-    });
-    
-    const transactions: WarmupTransaction[] = [];
-    let totalSpent = 0;
-    
-    for (let i = 0; i < txCount; i++) {
-      try {
-        const txType = this.selectTxType(warmupConfig);
-        
-        const tx = await this.executeWarmupTx(
-          keypair,
-          wallet.address,
-          txType,
-          warmupConfig
-        );
-        
-        transactions.push(tx);
-        
-        if (tx.success) {
-          totalSpent += tx.amount;
-        }
-        
-        if (callback) {
-          await callback(walletId, (i + 1) / txCount, i + 1, txCount);
-        }
-        
-        if (i < txCount - 1) {
-          const delay = this.randomInRange(
-            warmupConfig.delayBetweenTx.min,
-            warmupConfig.delayBetweenTx.max
-          );
-          await this.sleep(delay);
-        }
-      } catch (error) {
-        logger.error('Warmup transaction failed', { walletId, error });
-        
-        transactions.push({
-          type: 'random',
-          signature: '',
-          amount: 0,
-          from: wallet.address,
-          to: '',
-          success: false,
-          error: error instanceof Error ? error.message : 'Unknown error',
-          timestamp: new Date(),
-        });
-      }
-    }
-    
-    const successfulTx = transactions.filter(tx => tx.success).length;
-    const failedTx = transactions.filter(tx => !tx.success).length;
-    
+  private prepareMetadata(options: TokenDeployOptions): TokenMetadataIPFS {
     return {
-      walletId,
-      address: wallet.address,
-      transactions,
-      totalTx: txCount,
-      successfulTx,
-      failedTx,
-      totalSpent,
+      name: options.name,
+      symbol: options.symbol,
+      description: options.description || `${options.name} Token`,
+      image: options.imageUrl || '',
+      showName: true,
+      createdOn: 'https://pump.fun',
+      twitter: options.twitter,
+      telegram: options.telegram,
+      website: options.website,
     };
   }
   
   /**
-   * Select transaction type
+   * Upload metadata to IPFS
+   * 
+   * TODO: Implement actual IPFS upload
+   * Options:
+   * - Pinata API
+   * - NFT.storage
+   * - Web3.storage
+   * - IPFS HTTP client
    */
-  private selectTxType(warmupConfig: WarmupConfig): WarmupTxType {
-    if (!warmupConfig.txTypes || warmupConfig.txTypes.length === 0) {
-      const types: WarmupTxType[] = warmupConfig.mode === 'soft'
-        ? ['transfer']
-        : ['transfer', 'swap', 'token_transfer'];
-      
-      return types[Math.floor(Math.random() * types.length)];
-    }
-    
-    return warmupConfig.txTypes[Math.floor(Math.random() * warmupConfig.txTypes.length)];
-  }
-  
-  /**
-   * Execute warmup transaction
-   */
-  private async executeWarmupTx(
-    keypair: Keypair,
-    fromAddress: string,
-    txType: WarmupTxType,
-    warmupConfig: WarmupConfig
-  ): Promise<WarmupTransaction> {
-    const amount = this.randomInRange(
-      warmupConfig.amountRange.min,
-      warmupConfig.amountRange.max
-    );
-    
+  private async uploadToIPFS(
+    metadata: TokenMetadataIPFS,
+    _imageUrl?: string
+  ): Promise<IPFSUploadResult> {
     try {
-      switch (txType) {
-        case 'transfer':
-          return await this.executeTransfer(keypair, fromAddress, amount);
-        
-        case 'swap':
-          return await this.executeSwap(keypair, fromAddress, amount);
-        
-        case 'token_transfer':
-          return await this.executeTokenTransfer(keypair, fromAddress, amount);
-        
-        default:
-          return await this.executeTransfer(keypair, fromAddress, amount);
-      }
-    } catch (error) {
-      throw error;
-    }
-  }
-  
-  /**
-   * Execute SOL transfer (to self)
-   */
-  private async executeTransfer(
-    keypair: Keypair,
-    fromAddress: string,
-    amount: number
-  ): Promise<WarmupTransaction> {
-    try {
-      const toAddress = keypair.publicKey;
+      // TODO: Implement IPFS upload
+      // For now, return mock data
       
-      const transaction = new Transaction().add(
-        SystemProgram.transfer({
-          fromPubkey: keypair.publicKey,
-          toPubkey: toAddress,
-          lamports: solToLamports(amount),
-        })
-      );
+      logger.warn('IPFS upload not implemented, using mock data');
       
-      transaction.feePayer = keypair.publicKey;
-      const { blockhash } = await connection.getLatestBlockhash();
-      transaction.recentBlockhash = blockhash;
-      
-      transaction.sign(keypair);
-      
-      const signature = await connection.sendRawTransaction(
-        transaction.serialize(),
-        {
-          skipPreflight: false,
-          preflightCommitment: 'confirmed',
-        }
-      );
-      
-      await connection.confirmTransaction(signature, 'confirmed');
+      const mockUri = `ipfs://QmMockMetadataHash${Date.now()}`;
       
       return {
-        type: 'transfer',
-        signature,
-        amount,
-        from: fromAddress,
-        to: toAddress.toString(),
-        success: true,
-        timestamp: new Date(),
+        uri: mockUri,
+        metadata,
       };
-    } catch (error) {
-      throw error;
-    }
-  }
-  
-  /**
-   * Execute swap (SOL ↔ USDC via Jupiter)
-   */
-  private async executeSwap(
-    keypair: Keypair,
-    fromAddress: string,
-    amount: number
-  ): Promise<WarmupTransaction> {
-    try {
-      const buyUsdc = Math.random() > 0.5;
-      const amountLamports = Math.floor(amount * 1e9);
       
-      const quote = await this.getJupiterQuote(
-        buyUsdc ? this.SOL_MINT : this.USDC_MINT,
-        buyUsdc ? this.USDC_MINT : this.SOL_MINT,
-        amountLamports,
-        50
-      );
+      /*
+      // Example implementation with Pinata:
+      const formData = new FormData();
       
-      const swapTxBase64 = await this.getJupiterSwapTransaction(
-        quote,
-        keypair.publicKey.toString()
-      );
-      
-      const swapTxBuffer = Buffer.from(swapTxBase64, 'base64');
-      const transaction = VersionedTransaction.deserialize(swapTxBuffer);
-      
-      transaction.sign([keypair]);
-      
-      const signature = await connection.sendRawTransaction(
-        transaction.serialize(),
-        {
-          skipPreflight: false,
-          preflightCommitment: 'confirmed',
-        }
-      );
-      
-      await connection.confirmTransaction(signature, 'confirmed');
-      
-      logger.info('Warmup swap executed', {
-        address: fromAddress,
-        direction: buyUsdc ? 'SOL→USDC' : 'USDC→SOL',
-        amount,
-      });
-      
-      return {
-        type: 'swap',
-        signature,
-        amount,
-        from: fromAddress,
-        to: buyUsdc ? 'USDC' : 'SOL',
-        success: true,
-        timestamp: new Date(),
-      };
-    } catch (error) {
-      logger.warn('Swap failed, falling back to transfer', {
-        address: fromAddress,
-        error,
-      });
-      
-      return await this.executeTransfer(keypair, fromAddress, amount * 0.1);
-    }
-  }
-  
-  /**
-   * Execute token transfer (fallback to transfer)
-   */
-  private async executeTokenTransfer(
-    keypair: Keypair,
-    fromAddress: string,
-    amount: number
-  ): Promise<WarmupTransaction> {
-    logger.warn('Token transfer not fully implemented, using transfer', {
-      address: fromAddress,
-    });
-    
-    return await this.executeTransfer(keypair, fromAddress, amount * 0.1);
-  }
-  
-  /**
-   * Get Jupiter quote
-   */
-  private async getJupiterQuote(
-    inputMint: string,
-    outputMint: string,
-    amount: number,
-    slippageBps: number
-  ): Promise<JupiterQuoteResponse> {
-    try {
-      const params = new URLSearchParams({
-        inputMint,
-        outputMint,
-        amount: amount.toString(),
-        slippageBps: (slippageBps * 100).toString(),
-        onlyDirectRoutes: 'false',
-        asLegacyTransaction: 'false',
-      });
-      
-      const response = await fetch(`${this.JUPITER_QUOTE_API}?${params}`);
-      
-      if (!response.ok) {
-        const error = await response.text();
-        throw new Error(`Jupiter quote failed: ${error}`);
+      // Upload image first if provided
+      if (imageUrl) {
+        const imageResponse = await fetch(imageUrl);
+        const imageBlob = await imageResponse.blob();
+        formData.append('file', imageBlob);
+        
+        const imageUpload = await fetch('https://api.pinata.cloud/pinning/pinFileToIPFS', {
+          method: 'POST',
+          headers: {
+            'Authorization': `Bearer ${PINATA_JWT}`,
+          },
+          body: formData,
+        });
+        
+        const imageResult = await imageUpload.json();
+        metadata.image = `ipfs://${imageResult.IpfsHash}`;
       }
       
-      return await response.json() as JupiterQuoteResponse;
-    } catch (error) {
-      logger.error('Failed to get Jupiter quote', { error });
-      throw error;
-    }
-  }
-  
-  /**
-   * Get Jupiter swap transaction
-   */
-  private async getJupiterSwapTransaction(
-    quoteResponse: JupiterQuoteResponse,
-    userPublicKey: string
-  ): Promise<string> {
-    try {
-      const response = await fetch(this.JUPITER_SWAP_API, {
+      // Upload metadata JSON
+      const metadataUpload = await fetch('https://api.pinata.cloud/pinning/pinJSONToIPFS', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
+          'Authorization': `Bearer ${PINATA_JWT}`,
         },
-        body: JSON.stringify({
-          quoteResponse,
-          userPublicKey,
-          wrapAndUnwrapSol: true,
-          computeUnitPriceMicroLamports: config.compute.unitPrice,
-          dynamicComputeUnitLimit: true,
-        }),
+        body: JSON.stringify(metadata),
       });
       
-      if (!response.ok) {
-        const error = await response.text();
-        throw new Error(`Jupiter swap transaction failed: ${error}`);
-      }
+      const metadataResult = await metadataUpload.json();
       
-      const data = await response.json() as JupiterSwapResponse;
-      return data.swapTransaction;
+      return {
+        uri: `ipfs://${metadataResult.IpfsHash}`,
+        metadata,
+      };
+      */
     } catch (error) {
-      logger.error('Failed to get Jupiter swap transaction', { error });
+      logger.error('IPFS upload failed', { metadata, error });
       throw error;
     }
   }
   
   /**
-   * Calculate warmup stats
+   * Create token on Pump.fun
+   * 
+   * TODO: Implement actual Pump.fun integration
+   * Reference: https://github.com/FungiAgent/pumpfun-bundler
    */
-  async calculateStats(warmupConfig: WarmupConfig): Promise<WarmupStats> {
-    const avgTx = (warmupConfig.transactionsPerWallet.min + warmupConfig.transactionsPerWallet.max) / 2;
-    const avgAmount = (warmupConfig.amountRange.min + warmupConfig.amountRange.max) / 2;
-    const avgDelay = (warmupConfig.delayBetweenTx.min + warmupConfig.delayBetweenTx.max) / 2;
-    
-    const totalWallets = warmupConfig.walletIds.length;
-    const totalTx = totalWallets * avgTx;
-    const totalSpent = totalTx * avgAmount;
-    const estimatedTime = totalTx * avgDelay;
-    
-    return {
-      totalWallets,
-      warmedWallets: 0,
-      averageTxPerWallet: avgTx,
-      totalSpent,
-      estimatedTime,
-    };
+  private async createTokenOnPumpFun(
+    _creator: Keypair,
+    name: string,
+    symbol: string,
+    _metadataUri: string
+  ): Promise<TokenDeployResult> {
+    try {
+      // TODO: Implement Pump.fun token creation
+      // This requires:
+      // 1. Generate new mint keypair
+      // 2. Build Pump.fun create instruction
+      // 3. Sign and send transaction
+      // 4. Parse transaction result for bonding curve addresses
+      
+      logger.warn('Pump.fun integration not implemented, using mock data', {
+        name,
+        symbol,
+      });
+      
+      // Generate mock token address
+      const mockMint = Keypair.generate();
+      
+      return {
+        tokenAddress: mockMint.publicKey.toString(),
+        signature: 'MockSignature' + Date.now(),
+        bondingCurve: Keypair.generate().publicKey.toString(),
+        associatedBondingCurve: Keypair.generate().publicKey.toString(),
+      };
+      
+      /*
+      // Example implementation:
+      const mintKeypair = Keypair.generate();
+      
+      // Build Pump.fun create instruction
+      const createIx = await buildPumpFunCreateInstruction({
+        name,
+        symbol,
+        uri: metadataUri,
+        mint: mintKeypair.publicKey,
+        creator: creator.publicKey,
+      });
+      
+      // Build transaction
+      const transaction = new Transaction();
+      transaction.add(createIx);
+      
+      // Set fee payer and recent blockhash
+      transaction.feePayer = creator.publicKey;
+      const { blockhash } = await connection.getLatestBlockhash();
+      transaction.recentBlockhash = blockhash;
+      
+      // Sign with both creator and mint keypair
+      transaction.sign(creator, mintKeypair);
+      
+      // Send transaction
+      const signature = await connection.sendRawTransaction(
+        transaction.serialize(),
+        {
+          skipPreflight: false,
+          preflightCommitment: 'confirmed',
+        }
+      );
+      
+      // Wait for confirmation
+      await connection.confirmTransaction(signature, 'confirmed');
+      
+      // Parse transaction to get bonding curve addresses
+      const txInfo = await connection.getTransaction(signature, {
+        commitment: 'confirmed',
+      });
+      
+      // Extract addresses from transaction
+      const bondingCurve = extractBondingCurveFromTx(txInfo);
+      const associatedBondingCurve = extractAssociatedBondingCurveFromTx(txInfo);
+      
+      return {
+        tokenAddress: mintKeypair.publicKey.toString(),
+        signature,
+        bondingCurve: bondingCurve.toString(),
+        associatedBondingCurve: associatedBondingCurve.toString(),
+      };
+      */
+    } catch (error) {
+      logger.error('Pump.fun token creation failed', { name, symbol, error });
+      throw error;
+    }
   }
   
   /**
-   * Random number in range
+   * Get token info from blockchain
    */
-  private randomInRange(min: number, max: number): number {
-    return Math.random() * (max - min) + min;
+  async getTokenInfo(tokenAddress: string): Promise<TokenInfo | null> {
+    try {
+      const mint = new PublicKey(tokenAddress);
+      
+      // Get token account info
+      const accountInfo = await connection.getAccountInfo(mint);
+      
+      if (!accountInfo) {
+        return null;
+      }
+      
+      // TODO: Parse token metadata
+      // For now return basic info
+      
+      return {
+        mint: tokenAddress,
+        name: 'Unknown',
+        symbol: 'UNKNOWN',
+        decimals: 9,
+        supply: 0,
+      };
+    } catch (error) {
+      logger.error('Failed to get token info', { tokenAddress, error });
+      return null;
+    }
   }
   
   /**
-   * Sleep helper
+   * Clone metadata from existing token
+   * 
+   * Useful for "Create CTO" feature
    */
-  private sleep(seconds: number): Promise<void> {
-    return new Promise(resolve => setTimeout(resolve, seconds * 1000));
+  async cloneMetadata(tokenAddress: string): Promise<TokenMetadataIPFS | null> {
+    try {
+      // TODO: Fetch metadata from token
+      // 1. Get token metadata account
+      // 2. Fetch metadata URI
+      // 3. Fetch JSON from IPFS/Arweave
+      // 4. Return metadata
+      
+      logger.warn('Clone metadata not implemented');
+      
+      return null;
+    } catch (error) {
+      logger.error('Failed to clone metadata', { tokenAddress, error });
+      return null;
+    }
+  }
+  
+  /**
+   * Get CA (Contract Address) for project
+   * 
+   * Simply retrieves the token address from project
+   */
+  async getCA(projectId: number): Promise<string | null> {
+    try {
+      const project = await ProjectManager.getProject(projectId);
+      return project?.token_address || null;
+    } catch (error) {
+      logger.error('Failed to get CA', { projectId, error });
+      return null;
+    }
   }
 }
 
-export default new WalletWarmupService();
-
-export * from './types';
+// Export singleton instance
+export default new TokenDeployer();
