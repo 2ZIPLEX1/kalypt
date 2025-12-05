@@ -3,15 +3,47 @@
  */
 
 /**
+ * TP Level (уровень take profit)
+ */
+export interface TPLevel {
+  id?: number;
+  marketCapTarget: number; // Целевой market cap в USD
+  sellPercentage: number; // % от holdings для продажи (0-100)
+  executed?: boolean; // Уже выполнен?
+  executedAt?: Date; // Когда выполнен
+  signatures?: string[]; // Transaction signatures
+}
+
+/**
+ * Custom TP для конкретного кошелька
+ */
+export interface CustomWalletTP {
+  walletId: number;
+  levels: TPLevel[]; // Уровни TP для этого кошелька
+  enabled: boolean; // Включен ли custom TP для этого кошелька
+}
+
+/**
  * Конфигурация Auto TP
  */
 export interface AutoTPConfig {
   projectId: number;
   tokenAddress: string;
-  targetMcap: number; // Целевая капитализация в USD
-  sellPercentage: number; // Процент от holdings для продажи (0-100)
+  
+  // ВАРИАНТ 1: Простой режим (один уровень для всех)
+  targetMcap?: number; // Целевая капитализация в USD
+  sellPercentage?: number; // Процент от holdings для продажи (0-100)
+  
+  // ВАРИАНТ 2: Multiple levels (несколько уровней для всех кошельков)
+  levels?: TPLevel[]; // Массив уровней TP
+  
+  // ВАРИАНТ 3: Custom per wallet (индивидуальные настройки)
+  customWallets?: CustomWalletTP[]; // Custom TP для конкретных кошельков
+  
+  // Общие настройки
   checkInterval?: number; // Интервал проверки в мс (по умолчанию 30000)
   slippage?: number; // Slippage для продажи (по умолчанию 15)
+  excludeCreator?: boolean; // Исключить creator wallet (по умолчанию true)
 }
 
 /**
@@ -21,8 +53,17 @@ export interface AutoTPStatus {
   active: boolean;
   projectId: number;
   tokenAddress: string;
-  targetMcap: number;
-  sellPercentage: number;
+  
+  // Simple mode
+  targetMcap?: number;
+  sellPercentage?: number;
+  
+  // Multiple levels mode
+  levels?: TPLevel[];
+  
+  // Custom wallets mode
+  customWallets?: CustomWalletTP[];
+  
   currentMcap: number;
   startedAt: Date;
   lastCheck?: Date;
@@ -36,7 +77,8 @@ export interface AutoTPResult {
   projectId: number;
   tokenAddress: string;
   mcapAtExecution: number;
-  targetMcap: number;
+  targetMcap?: number; // Для simple mode
+  levelExecuted?: TPLevel; // Для multiple levels mode
   totalSold: number;
   totalSolReceived: number;
   executions: SellExecution[];
@@ -52,6 +94,7 @@ export interface SellExecution {
   solReceived: number;
   signature: string;
   timestamp: Date;
+  level?: TPLevel; // Какой уровень TP был выполнен (для multiple levels)
 }
 
 /**
@@ -61,38 +104,22 @@ export interface MonitoringState {
   projectId: number;
   tokenAddress: string;
   isActive: boolean;
-  targetMcap: number;
-  sellPercentage: number;
+  
+  // Simple mode
+  targetMcap?: number;
+  sellPercentage?: number;
+  
+  // Multiple levels mode
+  levels?: TPLevel[];
+  
+  // Custom wallets mode
+  customWallets?: CustomWalletTP[];
+  
   currentMcap: number;
   lastCheck: Date;
   checkCount: number;
-}
-
-/**
- * TP Level (уровень take profit)
- */
-export interface TPLevel {
-  id?: number;
-  marketCapTarget: number;
-  sellPercentage: number;
-  executed?: boolean;
-  executedAt?: Date;
-  signatures?: string[];
-}
-
-/**
- * Пресет Auto TP (для базы данных)
- */
-export interface AutoTPPresetDB {
-  id: number;
-  userId: number;
-  name: string;
-  targetMcap: number;
-  sellPercentage: number;
-  checkInterval: number;
-  slippage: number;
-  createdAt: Date;
-  updatedAt: Date;
+  startedAt: Date;
+  excludeCreator: boolean;
 }
 
 /**

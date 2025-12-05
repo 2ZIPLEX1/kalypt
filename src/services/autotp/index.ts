@@ -1,351 +1,390 @@
-import { Connection } from '@solana/web3.js';
+import { Keypair, Transaction, SystemProgram, PublicKey } from '@solana/web3.js';
+import {
+  Token,
+  TOKEN_PROGRAM_ID,
+  ASSOCIATED_TOKEN_PROGRAM_ID,
+} from '@solana/spl-token';
+import { connection, keypairFromPrivateKey } from '../../utils/solana';
 import { WalletModel } from '../../db/models/wallet';
-import SwapManager from '../../core/swap';
+import { solToLamports } from '../../constants/solana';
 import logger from '../../utils/logger';
 import {
-  AutoTPConfig,
-  AutoTPStatus,
-  AutoTPResult,
-  MonitoringState,
-  SellExecution,
+  WarmupConfig,
+  WarmupResult,
+  WalletWarmupResult,
+  WarmupTransaction,
+  WarmupTxType,
+  WarmupProgressCallback,
+  WarmupStats,
 } from './types';
 
 /**
- * Auto Take Profit Service
- * 
- * Автоматически продает токены при достижении целевой капитализации рынка
- * 
- * Функции:
- * - Мониторинг market cap токена
- * - Автоматическая продажа при достижении target_mcap
- * - Продажа заданного % от holdings
- * - Поддержка нескольких стратегий выхода
+ * Manual implementation of getAssociatedTokenAddress for old @solana/spl-token version
  */
-export class AutoTPService {
-  private connection: Connection;
-  private monitoringStates: Map<number, MonitoringState> = new Map();
+async function getAssociatedTokenAddressManual(
+  mint: PublicKey,
+  owner: PublicKey
+): Promise<PublicKey> {
+  const [address] = await PublicKey.findProgramAddress(
+    [
+      owner.toBuffer(),
+      TOKEN_PROGRAM_ID.toBuffer(),
+      mint.toBuffer(),
+    ],
+    ASSOCIATED_TOKEN_PROGRAM_ID
+  );
+  return address;
+}
 
-  constructor(connection: Connection) {
-    this.connection = connection;
-  }
-
+/**
+ * Wallet Warmup Service
+ * 
+ * Generates natural-looking transaction history to avoid bot detection:
+ * 
+ * Soft Mode:
+ * - Simple SOL transfers between project wallets
+ * - Random amounts and delays
+ * - 5-10 transactions per wallet
+ * 
+ * Hard Mode:
+ * - Multiple transaction types (transfers, swaps, token interactions)
+ * - Variable amounts and delays
+ * - 10-20 transactions per wallet
+ * - More realistic patterns
+ */
+export class WalletWarmupService {
   /**
-   * Запустить Auto TP для проекта
+   * Execute wallet warmup
    */
-  async start(config: AutoTPConfig): Promise<AutoTPStatus> {
+  async warmup(
+    config: WarmupConfig,
+    callback?: WarmupProgressCallback
+  ): Promise<WarmupResult> {
+    const startTime = Date.now();
+    
     try {
-      // Валидация конфига
-      this.validateConfig(config);
-
-      // Проверяем, что не запущен уже
-      if (this.monitoringStates.has(config.projectId)) {
-        throw new Error('Auto TP уже запущен для этого проекта');
-      }
-
-      // Получаем адрес токена
-      const tokenAddress = await this.getTokenAddress(config);
-
-      // Создаем состояние мониторинга
-      const state: MonitoringState = {
+      logger.info('Starting wallet warmup', {
         projectId: config.projectId,
-        tokenAddress,
-        isActive: true,
-        targetMcap: config.targetMcap,
-        sellPercentage: config.sellPercentage,
-        currentMcap: 0,
-        lastCheck: new Date(),
-        checkCount: 0,
-      };
-
-      this.monitoringStates.set(config.projectId, state);
-
-      // Запускаем мониторинг
-      this.startMonitoring(state, config);
-
-      logger.info('Auto TP запущен', {
-        projectId: config.projectId,
-        tokenAddress,
-        targetMcap: config.targetMcap,
+        walletCount: config.walletIds.length,
+        mode: config.mode,
       });
-
+      
+      const walletResults: WalletWarmupResult[] = [];
+      
+      // Warmup each wallet
+      for (const walletId of config.walletIds) {
+        try {
+          const result = await this.warmupWallet(walletId, config, callback);
+          walletResults.push(result);
+        } catch (error) {
+          logger.error('Wallet warmup failed', { walletId, error });
+          
+          walletResults.push({
+            walletId,
+            address: '',
+            transactions: [],
+            totalTx: 0,
+            successfulTx: 0,
+            failedTx: 0,
+            totalSpent: 0,
+          });
+        }
+      }
+      
+      // Calculate totals
+      const totalTransactions = walletResults.reduce((sum, r) => sum + r.totalTx, 0);
+      const successfulTransactions = walletResults.reduce((sum, r) => sum + r.successfulTx, 0);
+      const failedTransactions = walletResults.reduce((sum, r) => sum + r.failedTx, 0);
+      const totalSpent = walletResults.reduce((sum, r) => sum + r.totalSpent, 0);
+      
+      const duration = Date.now() - startTime;
+      
+      logger.info('Wallet warmup complete', {
+        totalTransactions,
+        successfulTransactions,
+        failedTransactions,
+        totalSpent,
+        duration: `${duration}ms`,
+      });
+      
       return {
-        active: true,
-        projectId: config.projectId,
-        tokenAddress,
-        targetMcap: config.targetMcap,
-        sellPercentage: config.sellPercentage,
-        currentMcap: 0,
-        startedAt: new Date(),
+        walletResults,
+        totalTransactions,
+        successfulTransactions,
+        failedTransactions,
+        totalSpent,
+        duration,
       };
     } catch (error) {
-      logger.error('Ошибка запуска Auto TP', { config, error });
+      logger.error('Warmup failed', { config, error });
       throw error;
     }
   }
-
+  
   /**
-   * Остановить Auto TP
+   * Warmup single wallet
    */
-  async stop(projectId: number): Promise<void> {
-    const state = this.monitoringStates.get(projectId);
-
-    if (!state) {
-      throw new Error('Auto TP не запущен для этого проекта');
+  private async warmupWallet(
+    walletId: number,
+    config: WarmupConfig,
+    callback?: WarmupProgressCallback
+  ): Promise<WalletWarmupResult> {
+    const wallet = await WalletModel.getWithPrivateKey(walletId);
+    
+    if (!wallet || !wallet.private_key) {
+      throw new Error('Cannot decrypt wallet');
     }
-
-    state.isActive = false;
-    this.monitoringStates.delete(projectId);
-
-    logger.info('Auto TP остановлен', { projectId });
-  }
-
-  /**
-   * Получить статус Auto TP
-   */
-  async getStatus(projectId: number): Promise<AutoTPStatus | null> {
-    const state = this.monitoringStates.get(projectId);
-
-    if (!state) {
-      return null;
+    
+    const keypair = keypairFromPrivateKey(wallet.private_key);
+    
+    // Determine number of transactions
+    const txCount = this.randomInRange(
+      config.transactionsPerWallet.min,
+      config.transactionsPerWallet.max
+    );
+    
+    logger.info('Warming up wallet', {
+      walletId,
+      address: wallet.address,
+      txCount,
+    });
+    
+    const transactions: WarmupTransaction[] = [];
+    let totalSpent = 0;
+    
+    // Execute transactions
+    for (let i = 0; i < txCount; i++) {
+      try {
+        // Select random tx type
+        const txType = this.selectTxType(config);
+        
+        // Execute transaction
+        const tx = await this.executeWarmupTx(
+          keypair,
+          wallet.address,
+          txType,
+          config
+        );
+        
+        transactions.push(tx);
+        
+        if (tx.success) {
+          totalSpent += tx.amount;
+        }
+        
+        // Progress callback
+        if (callback) {
+          await callback(walletId, (i + 1) / txCount, i + 1, txCount);
+        }
+        
+        // Random delay before next tx
+        if (i < txCount - 1) {
+          const delay = this.randomInRange(
+            config.delayBetweenTx.min,
+            config.delayBetweenTx.max
+          );
+          await this.sleep(delay);
+        }
+      } catch (error) {
+        logger.error('Warmup transaction failed', { walletId, error });
+        
+        transactions.push({
+          type: 'random',
+          signature: '',
+          amount: 0,
+          from: wallet.address,
+          to: '',
+          success: false,
+          error: error instanceof Error ? error.message : 'Unknown error',
+          timestamp: new Date(),
+        });
+      }
     }
-
+    
+    const successfulTx = transactions.filter(tx => tx.success).length;
+    const failedTx = transactions.filter(tx => !tx.success).length;
+    
     return {
-      active: state.isActive,
-      projectId: state.projectId,
-      tokenAddress: state.tokenAddress,
-      targetMcap: state.targetMcap,
-      sellPercentage: state.sellPercentage,
-      currentMcap: state.currentMcap,
-      startedAt: new Date(), // TODO: сохранять время старта
-      lastCheck: state.lastCheck,
+      walletId,
+      address: wallet.address,
+      transactions,
+      totalTx: txCount,
+      successfulTx,
+      failedTx,
+      totalSpent,
     };
   }
-
+  
   /**
-   * Валидация конфига
+   * Select transaction type based on config
    */
-  private validateConfig(config: AutoTPConfig): void {
-    if (!config.projectId) {
-      throw new Error('projectId обязателен');
+  private selectTxType(config: WarmupConfig): WarmupTxType {
+    if (!config.txTypes || config.txTypes.length === 0) {
+      // Default types for each mode
+      const types: WarmupTxType[] = config.mode === 'soft'
+        ? ['transfer']
+        : ['transfer', 'swap', 'token_transfer'];
+      
+      return types[Math.floor(Math.random() * types.length)];
     }
-
-    if (!config.tokenAddress) {
-      throw new Error('tokenAddress обязателен');
-    }
-
-    if (!config.targetMcap || config.targetMcap <= 0) {
-      throw new Error('targetMcap должен быть > 0');
-    }
-
-    if (!config.sellPercentage || config.sellPercentage <= 0 || config.sellPercentage > 100) {
-      throw new Error('sellPercentage должен быть между 0 и 100');
-    }
+    
+    return config.txTypes[Math.floor(Math.random() * config.txTypes.length)];
   }
-
+  
   /**
-   * Получить адрес токена из конфига
+   * Execute warmup transaction
    */
-  private async getTokenAddress(config: AutoTPConfig): Promise<string> {
-    // Токен адрес приходит в конфиге
-    return config.tokenAddress;
-  }
-
-  /**
-   * Запустить мониторинг market cap
-   */
-  private startMonitoring(state: MonitoringState, config: AutoTPConfig): void {
-    const checkInterval = config.checkInterval || 30000; // 30 секунд по умолчанию
-
-    const intervalId = setInterval(async () => {
-      if (!state.isActive) {
-        clearInterval(intervalId);
-        return;
-      }
-
-      try {
-        await this.checkAndExecute(state, config);
-      } catch (error) {
-        logger.error('Ошибка проверки Auto TP', {
-          projectId: state.projectId,
-          error,
-        });
-      }
-    }, checkInterval);
-  }
-
-  /**
-   * Проверить market cap и выполнить продажу если нужно
-   */
-  private async checkAndExecute(
-    state: MonitoringState,
-    config: AutoTPConfig
-  ): Promise<void> {
-    state.checkCount++;
-    state.lastCheck = new Date();
-
-    // Получаем текущий market cap
-    const currentMcap = await this.getCurrentMarketCap(state.tokenAddress);
-    state.currentMcap = currentMcap;
-
-    logger.debug('Auto TP проверка', {
-      projectId: state.projectId,
-      currentMcap,
-      targetMcap: state.targetMcap,
-      checkCount: state.checkCount,
-    });
-
-    // Проверяем условие
-    if (currentMcap >= state.targetMcap) {
-      logger.info('Auto TP триггер сработал', {
-        projectId: state.projectId,
-        currentMcap,
-        targetMcap: state.targetMcap,
-      });
-
-      // Выполняем продажу
-      await this.executeSell(state, config);
-
-      // Останавливаем мониторинг
-      state.isActive = false;
-    }
-  }
-
-  /**
-   * Получить текущий market cap токена
-   */
-  private async getCurrentMarketCap(tokenAddress: string): Promise<number> {
+  private async executeWarmupTx(
+    keypair: Keypair,
+    fromAddress: string,
+    txType: WarmupTxType,
+    config: WarmupConfig
+  ): Promise<WarmupTransaction> {
+    const amount = this.randomInRange(
+      config.amountRange.min,
+      config.amountRange.max
+    );
+    
     try {
-      // TODO: Реализовать получение реального market cap
-      // Варианты:
-      // 1. Jupiter API - https://quote-api.jup.ag/v6/quote
-      // 2. CoinGecko API - https://api.coingecko.com/api/v3/simple/token_price/solana
-      // 3. Pump.Fun API - специфичный для платформы
-      // 4. Raydium pool stats - через on-chain данные
-      
-      // Используем connection для проверки что токен существует и сеть доступна
-      const slot = await this.connection.getSlot();
-      
-      // Можно также проверить что токен mint существует:
-      // const mintInfo = await this.connection.getAccountInfo(new PublicKey(tokenAddress));
-      // if (!mintInfo) throw new Error('Token not found');
-
-      logger.warn('Используется моковый market cap', { 
-        tokenAddress,
-        currentSlot: slot,
-      });
-
-      // Пока возвращаем случайное значение для тестирования
-      // В реальной версии здесь будет API запрос
-      return Math.random() * 100000;
+      switch (txType) {
+        case 'transfer':
+          return await this.executeTransfer(keypair, fromAddress, amount);
+        
+        case 'swap':
+          return await this.executeSwap(keypair, fromAddress, amount);
+        
+        case 'token_transfer':
+          return await this.executeTokenTransfer(keypair, fromAddress, amount);
+        
+        default:
+          return await this.executeTransfer(keypair, fromAddress, amount);
+      }
     } catch (error) {
-      logger.error('Ошибка получения market cap', { tokenAddress, error });
-      return 0;
+      throw error;
     }
   }
-
+  
   /**
-   * Выполнить продажу
+   * Execute SOL transfer (to self or random address)
    */
-  private async executeSell(
-    state: MonitoringState,
-    config: AutoTPConfig
-  ): Promise<AutoTPResult> {
+  private async executeTransfer(
+    keypair: Keypair,
+    fromAddress: string,
+    amount: number
+  ): Promise<WarmupTransaction> {
     try {
-      // Получаем кошельки проекта
-      const wallets = await WalletModel.findByProjectId(state.projectId);
-
-      if (wallets.length === 0) {
-        throw new Error('Нет кошельков для продажи');
-      }
-
-      const walletIds = wallets.map(w => w.id);
-
-      // Выполняем продажу через SwapManager
-      const swapResult = await SwapManager.executeBatchSwap({
-        projectId: state.projectId,
-        walletIds,
-        tokenAddress: state.tokenAddress,
-        type: 'sell',
-        percentage: state.sellPercentage,
-        slippage: config.slippage || 15,
-      });
-
-      // Подготавливаем результат
-      const executions: SellExecution[] = swapResult.successful.map((s) => ({
-        walletId: s.walletId,
-        amountSold: s.amountIn,
-        solReceived: s.amountOut,
-        signature: s.signature,
-        timestamp: new Date(),
-      }));
-
-      const totalSold = executions.reduce((sum, e) => sum + e.amountSold, 0);
-      const totalSolReceived = executions.reduce((sum, e) => sum + e.solReceived, 0);
-
-      logger.info('Auto TP продажа выполнена', {
-        projectId: state.projectId,
-        totalSold,
-        totalSolReceived,
-        successCount: swapResult.totalSuccess,
-        failCount: swapResult.totalFailed,
-      });
-
+      // Transfer to self (looks like wallet activity)
+      const toAddress = keypair.publicKey;
+      
+      const transaction = new Transaction().add(
+        SystemProgram.transfer({
+          fromPubkey: keypair.publicKey,
+          toPubkey: toAddress,
+          lamports: solToLamports(amount),
+        })
+      );
+      
+      transaction.feePayer = keypair.publicKey;
+      const { blockhash } = await connection.getLatestBlockhash();
+      transaction.recentBlockhash = blockhash;
+      
+      transaction.sign(keypair);
+      
+      const signature = await connection.sendRawTransaction(
+        transaction.serialize(),
+        {
+          skipPreflight: false,
+          preflightCommitment: 'confirmed',
+        }
+      );
+      
+      await connection.confirmTransaction(signature, 'confirmed');
+      
       return {
+        type: 'transfer',
+        signature,
+        amount,
+        from: fromAddress,
+        to: toAddress.toString(),
         success: true,
-        projectId: state.projectId,
-        tokenAddress: state.tokenAddress,
-        mcapAtExecution: state.currentMcap,
-        targetMcap: state.targetMcap,
-        totalSold,
-        totalSolReceived,
-        executions,
+        timestamp: new Date(),
       };
     } catch (error) {
-      logger.error('Ошибка выполнения Auto TP продажи', {
-        projectId: state.projectId,
-        error,
-      });
-
-      return {
-        success: false,
-        projectId: state.projectId,
-        tokenAddress: state.tokenAddress,
-        mcapAtExecution: state.currentMcap,
-        targetMcap: state.targetMcap,
-        totalSold: 0,
-        totalSolReceived: 0,
-        executions: [],
-        error: error instanceof Error ? error.message : 'Unknown error',
-      };
+      throw error;
     }
   }
-
+  
   /**
-   * Получить все активные Auto TP
+   * Execute swap (placeholder - requires DEX integration)
    */
-  getActiveMonitoring(): AutoTPStatus[] {
-    const statuses: AutoTPStatus[] = [];
-
-    for (const state of this.monitoringStates.values()) {
-      if (state.isActive) {
-        statuses.push({
-          active: true,
-          projectId: state.projectId,
-          tokenAddress: state.tokenAddress,
-          targetMcap: state.targetMcap,
-          sellPercentage: state.sellPercentage,
-          currentMcap: state.currentMcap,
-          startedAt: new Date(), // TODO: сохранять время старта
-          lastCheck: state.lastCheck,
-        });
-      }
-    }
-
-    return statuses;
+  private async executeSwap(
+    keypair: Keypair,
+    fromAddress: string,
+    amount: number
+  ): Promise<WarmupTransaction> {
+    // TODO: Implement actual swap through Raydium/Jupiter
+    logger.warn('Swap not implemented, falling back to transfer', {
+      address: fromAddress,
+    });
+    
+    return await this.executeTransfer(keypair, fromAddress, amount);
+  }
+  
+  /**
+   * Execute token transfer (placeholder)
+   */
+  private async executeTokenTransfer(
+    keypair: Keypair,
+    fromAddress: string,
+    amount: number
+  ): Promise<WarmupTransaction> {
+    // TODO: Implement token transfer
+    logger.warn('Token transfer not implemented, falling back to transfer', {
+      address: fromAddress,
+    });
+    
+    return await this.executeTransfer(keypair, fromAddress, amount);
+  }
+  
+  /**
+   * Calculate warmup stats
+   */
+  async calculateStats(config: WarmupConfig): Promise<WarmupStats> {
+    const avgTx = (config.transactionsPerWallet.min + config.transactionsPerWallet.max) / 2;
+    const avgAmount = (config.amountRange.min + config.amountRange.max) / 2;
+    const avgDelay = (config.delayBetweenTx.min + config.delayBetweenTx.max) / 2;
+    
+    const totalWallets = config.walletIds.length;
+    const totalTx = totalWallets * avgTx;
+    const totalSpent = totalTx * avgAmount;
+    const estimatedTime = totalTx * avgDelay;
+    
+    return {
+      totalWallets,
+      warmedWallets: 0, // Will be updated after warmup
+      averageTxPerWallet: avgTx,
+      totalSpent,
+      estimatedTime,
+    };
+  }
+  
+  /**
+   * Random number in range
+   */
+  private randomInRange(min: number, max: number): number {
+    return Math.random() * (max - min) + min;
+  }
+  
+  /**
+   * Sleep helper
+   */
+  private sleep(seconds: number): Promise<void> {
+    return new Promise(resolve => setTimeout(resolve, seconds * 1000));
   }
 }
 
-// Экспортируем singleton instance
-export default new AutoTPService(
-  new Connection('https://api.mainnet-beta.solana.com')
-);
+// Export singleton instance
+export default new WalletWarmupService();
+
+// Export types
+export * from './types';
